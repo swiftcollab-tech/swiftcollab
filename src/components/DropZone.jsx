@@ -61,8 +61,6 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                 const status = connectionStatus[appKey];
                                 const isConnected = status?.connected === true;
                                 const isChecking = status === undefined;
-                                const hasAuthUrl = status?.authUrl;
-                                const hasError = status?.error; // App needs config (like API key)
                                 const requiresCustomModal = status?.requiresCustomModal; // Custom integration (like Frappe)
 
                                 return (
@@ -98,15 +96,15 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                             {app.name?.charAt(0) || '?'}
                                         </div>
 
-                                        {/* Connect button for disconnected apps (with authUrl, error, or custom modal requirement) */}
-                                        {!isConnected && !isChecking && (hasAuthUrl || hasError || requiresCustomModal) && (
+                                        {/* Connect button for disconnected apps */}
+                                        {!isConnected && !isChecking && (
                                             <button
                                                 onClick={(e) => handleConnect(e, app)}
                                                 className="absolute bottom-1 left-1 right-1 py-1 px-2 bg-orange-500 hover:bg-orange-600 text-white text-xs font-medium rounded-lg flex items-center justify-center gap-1 transition-colors shadow-lg z-20"
-                                                title={requiresCustomModal ? "Click to configure credentials" : (hasError ? "Click to configure" : "Click to authenticate")}
+                                                title={requiresCustomModal ? "Click to configure credentials" : "Choose how to connect"}
                                             >
                                                 <Link className="w-3 h-3" />
-                                                {requiresCustomModal ? 'Configure' : (hasError ? 'Configure' : 'Connect')}
+                                                {requiresCustomModal ? 'Configure' : 'Connect'}
                                             </button>
                                         )}
 

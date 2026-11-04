@@ -1,14 +1,18 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { useAuth } from '../contexts/AuthContext';
+import { API_URL } from '../services/api';
 import { Eye, EyeOff, Mail, Lock, User, ArrowRight, Loader2 } from 'lucide-react';
 
 export default function LoginPage({ onSuccess }) {
   const { login, register, error: authError } = useAuth();
-  const [isLogin, setIsLogin] = useState(true);
+  const invitationToken = new URLSearchParams(window.location.search).get('token');
+  const [isLogin, setIsLogin] = useState(!invitationToken);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [invitation, setInvitation] = useState(null);
+  const [invitationError, setInvitationError] = useState('');
 
   const [formData, setFormData] = useState({
     email: '',
@@ -16,6 +20,18 @@ export default function LoginPage({ onSuccess }) {
     name: '',
     confirmPassword: '',
   });
+
+  useEffect(() => {
+    if (!invitationToken) return;
+    fetch(`${API_URL}/api/auth/invitation?token=${encodeURIComponent(invitationToken)}`)
+      .then(async response => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Unable to load invitation');
+        setInvitation(data.invitation);
+        setFormData(previous => ({ ...previous, email: data.invitation.email || previous.email }));
+      })
+      .catch(err => setInvitationError(err.message));
+  }, [invitationToken]);
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -32,6 +48,7 @@ export default function LoginPage({ onSuccess }) {
         const result = await login({
           email: formData.email,
           password: formData.password,
+          invitationToken,
         });
 
         if (result.success) {
@@ -57,6 +74,7 @@ export default function LoginPage({ onSuccess }) {
           email: formData.email,
           password: formData.password,
           name: formData.name,
+          invitationToken,
         });
 
         if (result.success) {
@@ -139,6 +157,18 @@ export default function LoginPage({ onSuccess }) {
             </motion.div>
           )}
 
+          {invitationToken && !invitationError && (
+            <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-blue-200 text-sm">
+              You were invited to <strong>{invitation?.organization_name || 'a SwiftCollab organization'}</strong>
+              {invitation?.role ? ` as ${invitation.role}` : ''}. Sign in if you already have an account, or create one to accept.
+            </div>
+          )}
+          {invitationError && (
+            <div className="mb-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-300 text-sm">
+              {invitationError}
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Name field (only for registration) */}
             {!isLogin && (
@@ -178,6 +208,7 @@ export default function LoginPage({ onSuccess }) {
                   onChange={handleChange}
                   placeholder="you@example.com"
                   required
+                  readOnly={Boolean(invitation?.email)}
                   className="w-full pl-10 pr-4 py-3 bg-gray-900/50 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
                 />
               </div>

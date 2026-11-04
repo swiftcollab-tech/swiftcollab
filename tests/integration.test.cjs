@@ -11,7 +11,7 @@
 
 const assert = require('assert');
 
-const BACKEND_URL = 'http://localhost:4000';
+const BACKEND_URL = process.env.API_BASE_URL || 'http://localhost:4002';
 const FRONTEND_URL = 'http://localhost:5174';
 
 const testResults = [];

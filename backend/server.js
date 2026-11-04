@@ -69,7 +69,7 @@ const { sanitizeBody } = require('./middleware/validation');
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 4002;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -77,6 +77,17 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'auto').toLowerCase();
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || '127.0.0.1:7233';
+const ALLOWED_ORIGINS = new Set([
+  FRONTEND_URL,
+  ...(process.env.CORS_ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean),
+  ...(process.env.NODE_ENV === 'production' ? [] : [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+  ]),
+]);
 
 // -----------------------------------------------------------------------------
 // OpenAI API helper (injected into ToolRouter, SlotFiller, and Engines).
@@ -263,16 +274,7 @@ app.use(cors({
     // Allow requests with no origin (mobile apps, curl, etc.)
     if (!origin) return callback(null, true);
 
-    const allowedOrigins = [
-      FRONTEND_URL,
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://localhost:3000',
-      'http://127.0.0.1:5173',
-      'http://127.0.0.1:5174',
-    ];
-
-    if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+    if (ALLOWED_ORIGINS.has(origin)) {
       return callback(null, true);
     }
 
@@ -280,7 +282,7 @@ app.use(cors({
     return callback(null, false);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Organization-Id'],
 }));
 
@@ -668,4 +670,3 @@ main();
 
 module.exports = app;
 // Restart trigger
-

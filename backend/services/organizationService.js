@@ -108,8 +108,16 @@ function assertInvitableRole(role) {
 
 async function createInvitation({ organizationId, email, role = 'member', invitedByUserId, expiresInHours = 168, client = null }) {
   const normalizedEmail = assertEmail(email);
-  const token = createInvitationToken();
   const executor = client || { query };
+  const existingMember = await executor.query(
+    `SELECT 1 FROM organization_members m
+     JOIN users u ON u.id = m.user_id
+     WHERE m.organization_id = $1 AND lower(u.email) = lower($2)`,
+    [organizationId, normalizedEmail]
+  );
+  if (existingMember.rowCount > 0) throw new Error('This user is already a member of the organization');
+
+  const token = createInvitationToken();
   const result = await executor.query(
     `INSERT INTO organization_invitations
        (organization_id, email, role, token_hash, invited_by_user_id, expires_at)
@@ -137,6 +145,20 @@ async function getInvitationForToken(token, email, client = null) {
   return result.rows[0] || null;
 }
 
+async function getInvitationSummary(token) {
+  if (!token) throw new Error('Invitation token is required');
+  const result = await query(
+    `SELECT i.email, i.role, i.expires_at, o.name AS organization_name
+     FROM organization_invitations i
+     JOIN organizations o ON o.id = i.organization_id
+     WHERE i.token_hash = $1
+       AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > NOW()`,
+    [hashToken(token)]
+  );
+  if (result.rowCount === 0) throw new Error('Invitation is invalid, expired, or already used');
+  return result.rows[0];
+}
+
 async function acceptInvitation({ token, userId, email, client = null }) {
   const ownsTransaction = !client;
   const dbClient = client || await getClient();
@@ -147,7 +169,7 @@ async function acceptInvitation({ token, userId, email, client = null }) {
     await dbClient.query(
       `INSERT INTO organization_members (organization_id, user_id, role)
        VALUES ($1, $2, $3)
-       ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role, updated_at = NOW()`,
+       ON CONFLICT (organization_id, user_id) DO NOTHING`,
       [invitation.organization_id, userId, invitation.role]
     );
     await dbClient.query(
@@ -176,6 +198,32 @@ async function listMembers(organizationId) {
   return result.rows;
 }
 
+async function listPendingInvitations(organizationId) {
+  const result = await query(
+    `SELECT i.id, i.email, i.role, i.expires_at, i.created_at,
+            u.name AS invited_by_name, u.email AS invited_by_email
+     FROM organization_invitations i
+     JOIN users u ON u.id = i.invited_by_user_id
+     WHERE i.organization_id = $1
+       AND i.accepted_at IS NULL AND i.revoked_at IS NULL AND i.expires_at > NOW()
+     ORDER BY i.created_at DESC`,
+    [organizationId]
+  );
+  return result.rows;
+}
+
+async function getPendingInvitation({ organizationId, invitationId }) {
+  const result = await query(
+    `SELECT id, organization_id, email, role
+     FROM organization_invitations
+     WHERE id = $1 AND organization_id = $2
+       AND accepted_at IS NULL AND revoked_at IS NULL`,
+    [invitationId, organizationId]
+  );
+  if (result.rowCount === 0) throw new Error('Active invitation not found');
+  return result.rows[0];
+}
+
 async function updateMemberRole({ organizationId, userId, role }) {
   if (!VALID_ROLES.has(role) || role === 'owner') throw new Error('Invalid member role');
   const result = await query(
@@ -183,6 +231,17 @@ async function updateMemberRole({ organizationId, userId, role }) {
      WHERE organization_id = $1 AND user_id = $2 AND role <> 'owner'
      RETURNING organization_id, user_id, role`,
     [organizationId, userId, role]
+  );
+  if (result.rowCount === 0) throw new Error('Member not found or is an owner');
+  return result.rows[0];
+}
+
+async function removeMember({ organizationId, userId }) {
+  const result = await query(
+    `DELETE FROM organization_members
+     WHERE organization_id = $1 AND user_id = $2 AND role <> 'owner'
+     RETURNING user_id, role`,
+    [organizationId, userId]
   );
   if (result.rowCount === 0) throw new Error('Member not found or is an owner');
   return result.rows[0];
@@ -209,8 +268,12 @@ module.exports = {
   hashToken,
   createInvitation,
   getInvitationForToken,
+  getInvitationSummary,
   acceptInvitation,
   listMembers,
+  listPendingInvitations,
+  getPendingInvitation,
   updateMemberRole,
+  removeMember,
   revokeInvitation,
 };

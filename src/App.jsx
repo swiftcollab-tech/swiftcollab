@@ -4,12 +4,12 @@ import Sidebar from './components/Sidebar';
 import DropZone from './components/DropZone';
 import OrbitAnimation from './components/OrbitAnimation';
 import ERPNextConnectModal from './components/ERPNextConnectModal';
-import { Search, LogOut, User, Plus, Settings } from 'lucide-react';
+import InterviewSchedulingPanel from './components/InterviewSchedulingPanel';
+import OrganizationTeamPanel from './components/OrganizationTeamPanel';
+import { Search, LogOut, User, Plus, Settings, Key, Link2 } from 'lucide-react';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginPage from './pages/LoginPage';
-import { assistantApi, api as apiClient, ApiError } from './services/api';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+import { API_URL, assistantApi, api as apiClient, ApiError } from './services/api';
 
 // Simple markdown renderer for chat messages
 const renderMarkdown = (text) => {
@@ -224,6 +224,15 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     error: null
   });
 
+  // ---- Connect method chooser (Composio sign-in vs API key) ----
+  const [connectMethodModal, setConnectMethodModal] = useState({
+    visible: false,
+    app: null,
+    authUrl: null,
+    loading: false,
+    error: null
+  });
+
   // ---- ERPNext Connect Modal State (for Frappe/ERPNext with URL + API Key + Secret) ----
   const [erpNextModalVisible, setErpNextModalVisible] = useState(false);
 
@@ -379,38 +388,36 @@ function App({ initialWorkspace, onWorkspaceChange }) {
       if (data.connections) {
         setConnectionStatus(prev => ({ ...prev, ...data.connections }));
       }
+      return data.connections || {};
     } catch (err) {
       console.error('[Connection] Check error:', err);
+      return {};
     }
   };
 
+  const CUSTOM_CONNECT_APPS = ['frappe', 'erpnext'];
+
   // ---- Handle app Connect button click ----
   const onAppConnect = (app, authUrl) => {
-    // Check if app needs API key configuration
-    const status = connectionStatus[app.id];
-    if (status?.error && (status.error.includes('auth config') || status.error.includes('OAuth configuration') || status.error.includes('API_KEY'))) {
-      // Show API key modal for this app
-      console.log('[Connection] App needs API key config:', app.name);
+    if (CUSTOM_CONNECT_APPS.includes(app.id?.toLowerCase())) {
       showApiKeyModal(app.id.toUpperCase(), app.name);
       return;
     }
 
-    if (!authUrl) {
-      // No auth URL and no specific error - might need API key
-      console.log('[Connection] No auth URL for', app.name, '- showing API key modal');
-      showApiKeyModal(app.id.toUpperCase(), app.name);
-      return;
-    }
+    setConnectMethodModal({
+      visible: true,
+      app,
+      authUrl: authUrl || null,
+      loading: false,
+      error: null
+    });
+  };
 
-    console.log('[OAuth] Opening auth URL for', app.name);
-    const popup = window.open(authUrl, '_blank', 'width=600,height=700');
-
-    // Poll for connection success
+  const watchComposioPopup = (app, popup) => {
     const checkInterval = setInterval(async () => {
       try {
-        await checkAppConnections([app.id]);
-        const currentStatus = connectionStatus[app.id];
-        if (currentStatus?.connected) {
+        const connections = await checkAppConnections([app.id]);
+        if (connections[app.id]?.connected) {
           clearInterval(checkInterval);
           if (popup && !popup.closed) {
             popup.close();
@@ -425,8 +432,18 @@ function App({ initialWorkspace, onWorkspaceChange }) {
       }
     }, 3000);
 
-    // Stop polling after 2 minutes
     setTimeout(() => clearInterval(checkInterval), 120000);
+  };
+
+  const startComposioConnect = async (app, authUrl) => {
+    if (authUrl) {
+      console.log('[OAuth] Opening Composio auth URL for', app.name);
+      const popup = window.open(authUrl, '_blank', 'width=600,height=700');
+      watchComposioPopup(app, popup);
+      return;
+    }
+
+    await handleConnectApp(app.id);
   };
 
   // ---- Check connections when apps change ----
@@ -469,7 +486,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
       console.log('[OAuth] Initiate response:', data);
 
       if (data.redirectUrl) {
-        // Open OAuth in new window/tab
+        // Open Composio Connect Link / OAuth in a popup
         const popup = window.open(data.redirectUrl, '_blank', 'width=600,height=700');
 
         // If we have a connection ID, poll for its status
@@ -516,33 +533,25 @@ function App({ initialWorkspace, onWorkspaceChange }) {
           ]);
         }
       } else if (data.error) {
-        // Check if this is an "auth config required" error
-        if (data.error.includes('OAuth configuration') || data.error.includes('auth config')) {
-          // Show the OAuth config modal
-          await showOAuthConfigModal(toolkit);
-        } else if (data.error.includes('Missing required fields')) {
-          // Show connection params modal (for subdomain, etc.)
+        if (data.error.includes('Missing required fields')) {
           await showConnectionParamsModal(toolkit);
-        } else {
-          setMessages(prev => [
-            ...prev,
-            { role: 'assistant', text: `Failed to connect: ${data.error}` }
-          ]);
+          return;
         }
+        throw new Error(data.error);
+      } else {
+        throw new Error('Composio did not return a sign-in URL. Enable this app in your Composio dashboard, then try Sign in with Composio again.');
       }
     } catch (err) {
       console.error('Connect error:', err);
-      // Also check the error message
-      if (err.message?.includes('OAuth configuration') || err.message?.includes('auth config')) {
-        await showOAuthConfigModal(toolkit);
-      } else if (err.message?.includes('Missing required fields')) {
+      if (err.message?.includes('Missing required fields')) {
         await showConnectionParamsModal(toolkit);
-      } else {
-        setMessages(prev => [
-          ...prev,
-          { role: 'assistant', text: `Connection error: ${err.message}` }
-        ]);
+        return;
       }
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', text: `Failed to connect via Composio: ${err.message}` }
+      ]);
+      throw err;
     }
   };
 
@@ -753,8 +762,8 @@ function App({ initialWorkspace, onWorkspaceChange }) {
           { role: 'assistant', text: `✅ Credentials saved for ${apiKeyModal.appName}! Now connecting...` }
         ]);
 
-        // Now try to connect
-        await handleConnectApp(toolkit);
+        // Now try to connect using the saved API key credentials
+        await handleConnectApp(toolkit).catch(() => {});
 
         // Refresh connection status
         const allApps = [...aiOsApps, ...workOsApps];
@@ -1519,7 +1528,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                                 {m.toolkits.map((toolkit) => (
                                   <button
                                     key={toolkit}
-                                    onClick={() => handleConnectApp(toolkit)}
+                                    onClick={() => handleConnectApp(toolkit).catch(() => {})}
                                     className="px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-xs font-medium transition-colors"
                                   >
                                     Connect {toolkit.replace('GOOGLE', 'Google ')}
@@ -2152,6 +2161,100 @@ function App({ initialWorkspace, onWorkspaceChange }) {
           )}
         </AnimatePresence>
 
+        {/* Connect method chooser: Composio sign-in vs API key */}
+        <AnimatePresence>
+          {connectMethodModal.visible && connectMethodModal.app && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+              onClick={() => setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null })}
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-gray-800 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl border border-gray-700"
+                onClick={e => e.stopPropagation()}
+              >
+                <h2 className="text-xl font-semibold text-white mb-2">
+                  Connect {connectMethodModal.app.name}
+                </h2>
+                <p className="text-gray-400 text-sm mb-5">
+                  Choose how you want to sign in. Composio opens the app&apos;s own login (Google, Slack, and so on). API key is only for apps that give you a key in settings.
+                </p>
+
+                <div className="space-y-3">
+                  <button
+                    onClick={async () => {
+                      const { app, authUrl } = connectMethodModal;
+                      setConnectMethodModal(prev => ({ ...prev, loading: true, error: null }));
+                      try {
+                        await startComposioConnect(app, authUrl);
+                        setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null });
+                      } catch (err) {
+                        setConnectMethodModal(prev => ({
+                          ...prev,
+                          loading: false,
+                          error: err.message || 'Failed to start Composio sign-in'
+                        }));
+                      }
+                    }}
+                    disabled={connectMethodModal.loading}
+                    className="w-full text-left p-4 rounded-xl border border-cyan-500/40 bg-cyan-900/20 hover:bg-cyan-900/40 transition-colors disabled:opacity-60"
+                  >
+                    <div className="flex items-start gap-3">
+                      <Link2 className="w-5 h-5 text-cyan-400 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="text-white font-medium">
+                          {connectMethodModal.loading ? 'Opening Composio…' : 'Sign in with Composio'}
+                        </div>
+                        <div className="text-gray-400 text-sm mt-1">
+                          Recommended. Authorize {connectMethodModal.app.name} in a popup — no API key needed.
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      const app = connectMethodModal.app;
+                      setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null });
+                      showApiKeyModal(app.id.toUpperCase(), app.name);
+                    }}
+                    disabled={connectMethodModal.loading}
+                    className="w-full text-left p-4 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-60"
+                  >
+                    <div className="flex items-start gap-3">
+                      <Key className="w-5 h-5 text-amber-400 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="text-white font-medium">Use API key</div>
+                        <div className="text-gray-400 text-sm mt-1">
+                          Paste a key from {connectMethodModal.app.name} settings if you are not using Composio login.
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                </div>
+
+                {connectMethodModal.error && (
+                  <div className="mt-4 p-2 bg-red-900/30 border border-red-500/30 rounded text-red-300 text-sm">
+                    {connectMethodModal.error}
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null })}
+                  className="mt-5 w-full py-2 px-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
+                >
+                  Cancel
+                </button>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* API Key Modal (for API_KEY auth apps like Axonaut) */}
         <AnimatePresence>
           {apiKeyModal.visible && (
@@ -2261,9 +2364,11 @@ function App({ initialWorkspace, onWorkspaceChange }) {
 
 // Wrapper component that checks authentication and loads workspace
 function AppWithAuth() {
-  const { isAuthenticated, loading, user, logout, accessToken } = useAuth();
+  const { isAuthenticated, loading, user, logout, accessToken, organizations, activeOrganization, setActiveOrganization } = useAuth();
   const [workspace, setWorkspace] = useState(null);
   const [workspaceLoading, setWorkspaceLoading] = useState(true);
+  const [showInterviewScheduling, setShowInterviewScheduling] = useState(false);
+  const [showOrganizationTeam, setShowOrganizationTeam] = useState(false);
 
   // Load workspace when authenticated
   useEffect(() => {
@@ -2314,6 +2419,18 @@ function AppWithAuth() {
     <div className="relative">
       {/* User menu in top-right corner */}
       <div className="fixed top-4 right-4 z-50 flex items-center gap-3">
+        <button
+          onClick={() => setShowOrganizationTeam(true)}
+          className="px-3 py-2 bg-gray-800/80 hover:bg-gray-700 rounded-lg border border-gray-600 text-sm text-white"
+        >
+          {activeOrganization?.organization_name || 'Organization'} · {activeOrganization?.role || 'role'}
+        </button>
+        <button
+          onClick={() => setShowInterviewScheduling(true)}
+          className="px-3 py-2 bg-cyan-700/80 hover:bg-cyan-600 rounded-lg border border-cyan-400/30 text-sm text-white"
+        >
+          Schedule interviews
+        </button>
         <div className="flex items-center gap-2 px-3 py-2 bg-gray-800/80 backdrop-blur-sm rounded-lg border border-gray-700/50">
           <User className="w-4 h-4 text-gray-400" />
           <span className="text-sm text-gray-300">{user?.name || user?.email}</span>
@@ -2340,6 +2457,13 @@ function AppWithAuth() {
             .finally(() => setWorkspaceLoading(false));
         }}
       />
+      {showInterviewScheduling && <InterviewSchedulingPanel onClose={() => setShowInterviewScheduling(false)} />}
+      {showOrganizationTeam && <OrganizationTeamPanel
+        organizations={organizations}
+        activeOrganization={activeOrganization}
+        setActiveOrganization={setActiveOrganization}
+        onClose={() => setShowOrganizationTeam(false)}
+      />}
     </div>
   );
 }

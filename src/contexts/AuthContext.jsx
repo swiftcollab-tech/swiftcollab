@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+import { API_URL, api as apiClient } from '../services/api';
 
 const AuthContext = createContext(null);
 
@@ -17,6 +16,44 @@ export function AuthProvider({ children }) {
   const [accessToken, setAccessToken] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [organizations, setOrganizations] = useState([]);
+  const [activeOrganization, setActiveOrganizationState] = useState(null);
+
+  const acceptInvitation = useCallback(async (token, invitationToken) => {
+    if (!invitationToken) return null;
+    const response = await fetch(`${API_URL}/api/organizations/invitations/accept`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ token: invitationToken }),
+      credentials: 'include',
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Unable to accept invitation');
+    return data;
+  }, []);
+
+  const loadOrganizations = useCallback(async (token) => {
+    const response = await fetch(`${API_URL}/api/organizations`, {
+      headers: { Authorization: `Bearer ${token}` }, credentials: 'include',
+    });
+    if (!response.ok) throw new Error('Unable to load organizations');
+    const data = await response.json();
+    const items = data.organizations || [];
+    const savedId = localStorage.getItem('activeOrganizationId');
+    const selected = items.find(item => item.organization_id === savedId) || items[0] || null;
+    setOrganizations(items);
+    setActiveOrganizationState(selected);
+    apiClient.setOrganizationId(selected?.organization_id || null);
+    return selected;
+  }, []);
+
+  const setActiveOrganization = useCallback((organization) => {
+    setActiveOrganizationState(organization || null);
+    apiClient.setOrganizationId(organization?.organization_id || null);
+  }, []);
 
   // Load token from localStorage on mount
   useEffect(() => {
@@ -43,6 +80,17 @@ export function AuthProvider({ children }) {
         const data = await response.json();
         setUser(data.user);
         setAccessToken(token);
+        apiClient.setAccessToken(token);
+        const invitationToken = new URLSearchParams(window.location.search).get('token');
+        if (invitationToken) {
+          try {
+            await acceptInvitation(token, invitationToken);
+          } catch (invitationError) {
+            setError(invitationError.message);
+          }
+          window.history.replaceState({}, document.title, '/');
+        }
+        await loadOrganizations(token);
       } else {
         // Token might be expired, try to refresh
         await refreshToken();
@@ -56,7 +104,7 @@ export function AuthProvider({ children }) {
   };
 
   // Register
-  const register = async ({ email, password, name }) => {
+  const register = async ({ email, password, name, invitationToken = null }) => {
     setError(null);
     try {
       const response = await fetch(`${API_URL}/api/auth/register`, {
@@ -64,7 +112,7 @@ export function AuthProvider({ children }) {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ email, password, name }),
+        body: JSON.stringify({ email, password, name, invitationToken }),
         credentials: 'include',
       });
 
@@ -82,7 +130,7 @@ export function AuthProvider({ children }) {
   };
 
   // Login
-  const login = async ({ email, password }) => {
+  const login = async ({ email, password, invitationToken = null }) => {
     setError(null);
     try {
       const response = await fetch(`${API_URL}/api/auth/login`, {
@@ -100,9 +148,15 @@ export function AuthProvider({ children }) {
         throw new Error(data.error || 'Login failed');
       }
 
+      if (invitationToken) {
+        await acceptInvitation(data.accessToken, invitationToken);
+        window.history.replaceState({}, document.title, '/');
+      }
       setUser(data.user);
       setAccessToken(data.accessToken);
       localStorage.setItem('accessToken', data.accessToken);
+      apiClient.setAccessToken(data.accessToken);
+      await loadOrganizations(data.accessToken);
 
       // Schedule token refresh
       scheduleTokenRefresh(data.expiresIn);
@@ -129,6 +183,7 @@ export function AuthProvider({ children }) {
       const data = await response.json();
       setAccessToken(data.accessToken);
       localStorage.setItem('accessToken', data.accessToken);
+      apiClient.setAccessToken(data.accessToken);
 
       // Fetch user with new token
       await fetchUser(data.accessToken);
@@ -176,6 +231,9 @@ export function AuthProvider({ children }) {
     } finally {
       setUser(null);
       setAccessToken(null);
+      setOrganizations([]);
+      setActiveOrganizationState(null);
+      apiClient.setOrganizationId(null);
       localStorage.removeItem('accessToken');
     }
   };
@@ -249,6 +307,11 @@ export function AuthProvider({ children }) {
     changePassword,
     getAuthHeader,
     refreshToken,
+    organizations,
+    activeOrganization,
+    setActiveOrganization,
+    loadOrganizations,
+    acceptInvitation,
   };
 
   return (

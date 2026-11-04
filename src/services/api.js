@@ -8,7 +8,7 @@
  * - Retry logic
  */
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4002';
 
 class ApiError extends Error {
   constructor(message, status, data) {
@@ -23,12 +23,19 @@ class ApiService {
   constructor() {
     this.baseUrl = API_URL;
     this.accessToken = null;
+    this.organizationId = localStorage.getItem('activeOrganizationId');
     this.refreshPromise = null;
     this.onUnauthorized = null; // Callback for auth errors
   }
 
   setAccessToken(token) {
     this.accessToken = token;
+  }
+
+  setOrganizationId(organizationId) {
+    this.organizationId = organizationId || null;
+    if (organizationId) localStorage.setItem('activeOrganizationId', organizationId);
+    else localStorage.removeItem('activeOrganizationId');
   }
 
   setUnauthorizedCallback(callback) {
@@ -43,6 +50,9 @@ class ApiService {
 
     if (this.accessToken) {
       headers['Authorization'] = `Bearer ${this.accessToken}`;
+    }
+    if (this.organizationId) {
+      headers['X-Organization-Id'] = this.organizationId;
     }
 
     return headers;
@@ -208,6 +218,40 @@ export const connectionApi = {
   list: () => api.get('/api/connections/list'),
   createAuthConfig: (data) => api.post('/api/auth-config/create', data),
   getAuthConfigFields: (toolkit) => api.get(`/api/auth-config/fields/${toolkit}`),
+};
+
+export const organizationApi = {
+  list: () => api.get('/api/organizations'),
+  members: (organizationId) => api.get(`/api/organizations/${organizationId}/members`),
+  invitations: (organizationId) => api.get(`/api/organizations/${organizationId}/invitations`),
+  invite: (organizationId, data) => api.post(`/api/organizations/${organizationId}/invitations`, data),
+  acceptInvitation: (token) => api.post('/api/organizations/invitations/accept', { token }),
+  revokeInvitation: (organizationId, invitationId) => api.delete(`/api/organizations/${organizationId}/invitations/${invitationId}`),
+  resendInvitation: (organizationId, invitationId) => api.post(`/api/organizations/${organizationId}/invitations/${invitationId}/resend`, {}),
+  updateMemberRole: (organizationId, userId, role) => api.request(`/api/organizations/${organizationId}/members/${userId}`, {
+    method: 'PATCH', body: JSON.stringify({ role }),
+  }),
+  removeMember: (organizationId, userId) => api.delete(`/api/organizations/${organizationId}/members/${userId}`),
+};
+
+// Sprint 1: read-only interview scheduling proposals. No external write APIs exist here.
+export const interviewSchedulingApi = {
+  getConfiguration: () => api.get('/api/interview-scheduling/configuration'),
+  saveConfiguration: (data) => api.put('/api/interview-scheduling/configuration', data),
+  getAssignments: () => api.get('/api/interview-scheduling/assignments'),
+  getProposals: () => api.get('/api/interview-scheduling/proposals'),
+  getAutomation: () => api.get('/api/interview-scheduling/automation'),
+  setAutomation: (enabled) => api.put('/api/interview-scheduling/automation', { enabled }),
+  retryUnsuccessfulAutomation: () => api.post('/api/interview-scheduling/automation/retry-unsuccessful', {}),
+  createProposal: (assignmentId) => api.post('/api/interview-scheduling/proposals', { assignmentId }),
+  updateProposal: (proposalId, data) => api.request(`/api/interview-scheduling/proposals/${proposalId}`, {
+    method: 'PATCH', body: JSON.stringify(data),
+  }),
+  scheduleSelectedProposal: (proposalId) => api.post(`/api/interview-scheduling/proposals/${proposalId}/schedule`, {}),
+};
+export const googleWorkspaceApi = {
+  connect: () => api.post('/api/integrations/google/connect', {}),
+  status: () => api.get('/api/integrations/google/status'),
 };
 
 // Health Check

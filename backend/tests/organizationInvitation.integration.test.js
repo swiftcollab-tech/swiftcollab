@@ -44,6 +44,16 @@ async function run() {
     );
     assert.strictEqual(membership.rows[0].role, 'viewer');
     await assert.rejects(
+      () => createInvitation({
+        organizationId: organization.id,
+        email: inviteeEmail,
+        role: 'member',
+        invitedByUserId: owner.rows[0].id,
+        client,
+      }),
+      /already a member/
+    );
+    await assert.rejects(
       () => acceptInvitation({ token, userId: invitee.rows[0].id, email: inviteeEmail, client }),
       /invalid, expired, or already used/
     );

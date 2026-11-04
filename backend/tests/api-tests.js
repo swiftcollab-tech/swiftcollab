@@ -12,7 +12,7 @@
 
 const assert = require('assert');
 
-const BASE_URL = 'http://localhost:4000';
+const BASE_URL = process.env.API_BASE_URL || 'http://localhost:4002';
 
 // Test results tracking
 const testResults = [];

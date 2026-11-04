@@ -2,12 +2,37 @@
 const express = require('express');
 const router = express.Router();
 const authService = require('../services/authService');
+const { getInvitationSummary } = require('../services/organizationService');
 const {
   authenticateToken,
   rateLimitLogin,
   recordFailedLogin,
   clearLoginAttempts,
 } = require('../middleware/auth');
+
+function refreshCookieOptions() {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const sameSite = process.env.COOKIE_SAME_SITE || (isProduction ? 'lax' : 'lax');
+  const options = {
+    httpOnly: true,
+    secure: process.env.COOKIE_SECURE ? process.env.COOKIE_SECURE === 'true' : isProduction,
+    sameSite,
+    path: '/api/auth',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  };
+  if (process.env.COOKIE_DOMAIN) options.domain = process.env.COOKIE_DOMAIN;
+  return options;
+}
+
+// GET /api/auth/invitation?token=... lets the invitation landing page show
+// trusted organization details without exposing the stored token hash.
+router.get('/invitation', async (req, res) => {
+  try {
+    res.json({ invitation: await getInvitationSummary(req.query.token) });
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
 
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
@@ -54,12 +79,7 @@ router.post('/login', rateLimitLogin, async (req, res) => {
     clearLoginAttempts(req);
 
     // Set refresh token as HTTP-only cookie
-    res.cookie('refreshToken', result.refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    });
+    res.cookie('refreshToken', result.refreshToken, refreshCookieOptions());
 
     res.json({
       user: result.user,
@@ -105,7 +125,7 @@ router.post('/logout', async (req, res) => {
     }
 
     // Clear cookie
-    res.clearCookie('refreshToken');
+    res.clearCookie('refreshToken', refreshCookieOptions());
 
     res.json({ message: 'Logged out successfully' });
   } catch (error) {
@@ -118,7 +138,7 @@ router.post('/logout', async (req, res) => {
 router.post('/logout-all', authenticateToken, async (req, res) => {
   try {
     await authService.logoutAll(req.user.userId);
-    res.clearCookie('refreshToken');
+    res.clearCookie('refreshToken', refreshCookieOptions());
     res.json({ message: 'Logged out from all devices' });
   } catch (error) {
     console.error('[Auth] Logout all error:', error.message);

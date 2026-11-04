@@ -10,8 +10,16 @@ const {
 } = require('./organizationService');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-key-change-in-production';
-const JWT_EXPIRES_IN = '15m'; // Access token expires in 15 minutes
-const REFRESH_TOKEN_EXPIRES_IN = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
+const REFRESH_TOKEN_EXPIRES_IN = Number(process.env.REFRESH_TOKEN_EXPIRES_IN_MS) || 7 * 24 * 60 * 60 * 1000;
+
+if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'your-super-secret-key-change-in-production') {
+  throw new Error('JWT_SECRET must be configured in production');
+}
+
+function hashRefreshToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
 
 class AuthService {
   // Hash password
@@ -159,7 +167,7 @@ class AuthService {
     await query(
       `INSERT INTO user_sessions (user_id, refresh_token, device_info, ip_address, expires_at)
        VALUES ($1, $2, $3, $4, $5)`,
-      [user.id, refreshToken, deviceInfo, ipAddress, expiresAt]
+      [user.id, hashRefreshToken(refreshToken), deviceInfo, ipAddress, expiresAt]
     );
 
     // Update last login
@@ -194,7 +202,7 @@ class AuthService {
        WHERE s.refresh_token = $1
          AND s.expires_at > NOW()
          AND s.is_revoked = false`,
-      [refreshToken]
+      [hashRefreshToken(refreshToken)]
     );
 
     if (result.rows.length === 0) {
@@ -224,7 +232,7 @@ class AuthService {
   async logout(refreshToken) {
     await query(
       'UPDATE user_sessions SET is_revoked = true WHERE refresh_token = $1',
-      [refreshToken]
+      [hashRefreshToken(refreshToken)]
     );
   }
 
