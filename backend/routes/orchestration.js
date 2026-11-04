@@ -81,7 +81,9 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
       } = req.body || {};
 
       const userId = req.user.userId;
-      const entityId = `org_${req.organization.organization_id}`;
+      // Connections are user-scoped by default so one organization member can
+      // never execute against another member's personal account.
+      const entityId = `user_${userId}`;
 
       const normalizedToolkits = normalizeSelectedToolkits({ selectedApps, selectedToolkits });
       if (normalizedToolkits.length === 0) {
@@ -460,7 +462,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
     try {
       const { appIds } = req.body || {};
       const userId = req.user.userId;
-      const entityId = `org_${req.organization.organization_id}`;
+      const entityId = `user_${userId}`;
 
       if (!Array.isArray(appIds) || appIds.length === 0) {
         return res.json({ connections: {} });
@@ -661,11 +663,11 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
   });
 
   // Initiate connection for a toolkit
-  router.post("/connections/initiate", authenticateToken, requireOrganization(['owner', 'admin']), async (req, res) => {
+  router.post("/connections/initiate", authenticateToken, requireOrganization(['owner', 'admin', 'member']), async (req, res) => {
     try {
       const { appId, redirectUrl, connectionParams } = req.body || {};
       const userId = req.user.userId;
-      const entityId = `org_${req.organization.organization_id}`;
+      const entityId = `user_${userId}`;
 
       if (!appId) {
         return res.status(400).json({ error: "appId is required" });
