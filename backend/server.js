@@ -80,7 +80,24 @@ const FRONTEND_URL = process.env.FRONTEND_URL || RENDER_APP_URL || 'http://local
 // has been configured yet.
 if (!process.env.APP_URL) process.env.APP_URL = FRONTEND_URL;
 const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+function normalizeBearerCredential(value, variableName) {
+  const rawValue = String(value || '');
+  const normalizedValue = rawValue
+    .trim()
+    .replace(/^Bearer\s+/i, '')
+    .replace(/\s+/g, '');
+
+  if (rawValue && rawValue !== normalizedValue) {
+    console.warn(`[Config] Removed invalid whitespace or a Bearer prefix from ${variableName}`);
+  }
+
+  return normalizedValue;
+}
+
+// Render secrets must contain only the key. Normalize accidental pasted
+// whitespace/prefixes so they cannot produce an invalid HTTP header value.
+const OPENAI_API_KEY = normalizeBearerCredential(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY');
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'auto').toLowerCase();
