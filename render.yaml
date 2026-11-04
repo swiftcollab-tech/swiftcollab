@@ -13,7 +13,7 @@ services:
     plan: free
     branch: develop
     autoDeployTrigger: off
-    buildCommand: npm ci && npm run build && cd backend && npm ci --omit=dev
+    buildCommand: npm ci --include=dev && npm run build && cd backend && npm ci --omit=dev
     startCommand: cd backend && npm start
     healthCheckPath: /api/health/live
     envVars:
