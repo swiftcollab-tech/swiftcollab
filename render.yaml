@@ -46,8 +46,6 @@ services:
         value: lax
       - key: TEMPORAL_ENABLED
         value: "false"
-      - key: AI_PROVIDER
-        value: openai
       - key: OPENAI_API_KEY
         sync: false
       - key: COMPOSIO_API_KEY

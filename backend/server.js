@@ -98,9 +98,6 @@ function normalizeBearerCredential(value, variableName) {
 // Render secrets must contain only the key. Normalize accidental pasted
 // whitespace/prefixes so they cannot produce an invalid HTTP header value.
 const OPENAI_API_KEY = normalizeBearerCredential(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY');
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const AI_PROVIDER = (process.env.AI_PROVIDER || 'auto').toLowerCase();
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || '127.0.0.1:7233';
 const TEMPORAL_ENABLED = process.env.TEMPORAL_ENABLED !== 'false';
 const ALLOWED_ORIGINS = new Set([
@@ -152,7 +149,7 @@ async function callOpenAI(systemPrompt, userPrompt, temperature = 0.1) {
       }
 
       const error = await response.text();
-      lastError = new Error(`Gemini API error: ${response.status} - ${error}`);
+      lastError = new Error(`OpenAI API error: ${response.status} - ${error}`);
       const isQuotaExhausted = response.status === 429 &&
         /quota exceeded|insufficient_quota/i.test(error);
       const isTransient = [500, 502, 503, 504].includes(response.status) ||
@@ -183,108 +180,9 @@ async function callOpenAI(systemPrompt, userPrompt, temperature = 0.1) {
   throw lastError;
 }
 
-async function callGoogleGemini(systemPrompt, userPrompt) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not configured');
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }] }],
-        generationConfig: { maxOutputTokens: 8192 },
-      }),
-    }
-  );
-
-  if (!response.ok) throw new Error(`Gemini API error: ${response.status} - ${await response.text()}`);
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
-
-async function callOpenRouter(systemPrompt, userPrompt, temperature = 0.1) {
-  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY not configured');
-
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      'HTTP-Referer': FRONTEND_URL,
-      'X-Title': 'SwiftCollab',
-    },
-    body: JSON.stringify({
-      model: 'openrouter/free',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature,
-      max_tokens: 8192,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenRouter API error: ${response.status} - ${await response.text()}`);
-  }
-
-  const data = await response.json();
-  const choice = data.choices?.[0];
-  const content = choice?.message?.content ?? choice?.text;
-  const outputText = typeof content === 'string'
-    ? content
-    : Array.isArray(content)
-      ? content.map(part => part.text || part.content || '').join('')
-      : '';
-  if (!outputText) {
-    const finishReason = choice?.finish_reason || 'unknown';
-    throw new Error(`OpenRouter returned no text output (finish reason: ${finishReason})`);
-  }
-  return outputText;
-}
-
-// Existing orchestration components consume this callback under the legacy
-// `callGemini` name; the implementation now selects a provider at runtime.
-async function callGemini(systemPrompt, userPrompt, temperature = 0.1) {
-  const hasOpenAI = Boolean(OPENAI_API_KEY);
-  const hasGemini = Boolean(GEMINI_API_KEY);
-  const hasOpenRouter = Boolean(OPENROUTER_API_KEY);
-
-  if (AI_PROVIDER === 'openai') return callOpenAI(systemPrompt, userPrompt, temperature);
-  if (AI_PROVIDER === 'gemini') return callGoogleGemini(systemPrompt, userPrompt);
-  if (AI_PROVIDER === 'openrouter') return callOpenRouter(systemPrompt, userPrompt, temperature);
-  if (AI_PROVIDER !== 'auto') throw new Error(`Unsupported AI_PROVIDER: ${AI_PROVIDER}. Use auto, openai, gemini, or openrouter.`);
-
-  const providerErrors = [];
-  const providers = [
-    hasOpenAI && { name: 'OpenAI', call: () => callOpenAI(systemPrompt, userPrompt, temperature) },
-    hasGemini && { name: 'Gemini', call: () => callGoogleGemini(systemPrompt, userPrompt) },
-    hasOpenRouter && { name: 'OpenRouter', call: () => callOpenRouter(systemPrompt, userPrompt, temperature) },
-  ].filter(Boolean);
-
-  for (const provider of providers) {
-    try {
-      return await provider.call();
-    } catch (error) {
-      providerErrors.push({ name: provider.name, error });
-      console.warn(`[AI] ${provider.name} failed; trying the next configured provider: ${error.message}`);
-    }
-  }
-
-  if (providerErrors.length === 0) {
-    throw new Error('No AI provider configured. Set OPENAI_API_KEY, GEMINI_API_KEY, and/or OPENROUTER_API_KEY.');
-  }
-
-  const allExhausted = providerErrors.every(({ error }) =>
-    /quota exceeded|daily limit exceeded|resource_exhausted|insufficient_quota/i.test(error.message)
-  );
-  if (allExhausted) {
-    throw new Error('All configured AI providers are exhausted. Add quota or billing, then retry.');
-  }
-
-  throw new Error(`All configured AI providers failed: ${providerErrors.map(({ name, error }) => `${name}: ${error.message}`).join(' | ')}`);
-}
+// Existing orchestration components still consume this callback under the
+// legacy `callGemini` name. It is intentionally OpenAI-only.
+const callGemini = callOpenAI;
 
 // -----------------------------------------------------------------------------
 // Initialize Express App
@@ -405,8 +303,8 @@ app.get('/api/health/detailed', authenticateToken, async (_req, res) => {
       composio: {
         configured: !!COMPOSIO_API_KEY,
       },
-      gemini: {
-        configured: !!GEMINI_API_KEY,
+      openai: {
+        configured: !!OPENAI_API_KEY,
       },
     },
   });
