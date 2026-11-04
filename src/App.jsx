@@ -6,10 +6,10 @@ import OrbitAnimation from './components/OrbitAnimation';
 import ERPNextConnectModal from './components/ERPNextConnectModal';
 import InterviewSchedulingPanel from './components/InterviewSchedulingPanel';
 import OrganizationTeamPanel from './components/OrganizationTeamPanel';
-import { Search, LogOut, User, Plus, Settings, Key, Link2 } from 'lucide-react';
+import { Search, LogOut, User, Plus, Settings, Key, Link2, MessageSquarePlus, Trash2 } from 'lucide-react';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginPage from './pages/LoginPage';
-import { API_URL, assistantApi, api as apiClient, ApiError } from './services/api';
+import { API_URL, assistantApi, conversationApi, api as apiClient, ApiError } from './services/api';
 
 // Simple markdown renderer for chat messages
 const renderMarkdown = (text) => {
@@ -164,7 +164,7 @@ const FancyOS = ({ className = "" }) => (
 );
 
 function App({ initialWorkspace, onWorkspaceChange }) {
-  const { accessToken, logout } = useAuth();
+  const { accessToken, logout, activeOrganization } = useAuth();
   const [leftApps, setLeftApps] = useState(INITIAL_LEFT_APPS);
   const [rightApps, setRightApps] = useState(INITIAL_RIGHT_APPS);
   const [aiOsApps, setAiOsApps] = useState(() => enrichAppsWithLogos(initialWorkspace?.aiOsApps || []));
@@ -183,6 +183,9 @@ function App({ initialWorkspace, onWorkspaceChange }) {
   // ---- chat + backend state ----
   const [command, setCommand] = useState('');
   const [messages, setMessages] = useState([]); // { role: 'user' | 'assistant', text: string }[]
+  const [conversations, setConversations] = useState([]);
+  const [activeConversationId, setActiveConversationId] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [followupContext, setFollowupContext] = useState(null);
   const [followupQuestions, setFollowupQuestions] = useState([]);
   const [answers, setAnswers] = useState({}); // { id: answer }
@@ -269,6 +272,101 @@ function App({ initialWorkspace, onWorkspaceChange }) {
   useEffect(() => {
     apiClient.setAccessToken(accessToken || null);
   }, [accessToken]);
+
+  const mapStoredMessages = (items = []) => items.map(item => ({
+    ...(item.metadata || {}),
+    id: item.id,
+    role: item.role,
+    text: item.content,
+    createdAt: item.created_at,
+  }));
+
+  const loadConversation = async (conversationId) => {
+    if (!conversationId) {
+      setActiveConversationId(null);
+      setMessages([]);
+      setFollowupContext(null);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      const data = await conversationApi.messages(conversationId);
+      const restored = mapStoredMessages(data.messages);
+      setActiveConversationId(conversationId);
+      setMessages(restored);
+      const lastAssistant = [...restored].reverse().find(item => item.role === 'assistant');
+      if (lastAssistant?.type === 'needs_info' || lastAssistant?.type === 'confirmation_required') {
+        setFollowupContext(lastAssistant.followupContext || null);
+      } else {
+        setFollowupContext(null);
+      }
+    } catch (error) {
+      console.error('[ChatHistory] Unable to load conversation:', error);
+      setMessages([{ role: 'assistant', text: 'Unable to load this conversation.' }]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const refreshConversationList = async (preferredConversationId = null) => {
+    try {
+      const data = await conversationApi.list();
+      const items = data.conversations || [];
+      setConversations(items);
+      return preferredConversationId || items[0]?.id || null;
+    } catch (error) {
+      console.error('[ChatHistory] Unable to list conversations:', error);
+      return preferredConversationId;
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    async function initializeHistory() {
+      if (!accessToken || !activeOrganization?.organization_id) return;
+      setHistoryLoading(true);
+      setMessages([]);
+      setActiveConversationId(null);
+      try {
+        const data = await conversationApi.list();
+        if (cancelled) return;
+        const items = data.conversations || [];
+        setConversations(items);
+        if (items[0]) await loadConversation(items[0].id);
+      } catch (error) {
+        if (!cancelled) console.error('[ChatHistory] Initialization failed:', error);
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    }
+    initializeHistory();
+    return () => { cancelled = true; };
+  }, [accessToken, activeOrganization?.organization_id]);
+
+  const handleNewConversation = () => {
+    setActiveConversationId(null);
+    setMessages([]);
+    setFollowupContext(null);
+    setFollowupQuestions([]);
+    setAnswers({});
+    setLastCommand('');
+  };
+
+  const handleDeleteConversation = async () => {
+    if (!activeConversationId) return;
+    if (!window.confirm('Clear this conversation? The chat messages will be permanently deleted.')) return;
+    try {
+      await conversationApi.remove(activeConversationId);
+      const data = await conversationApi.list();
+      const items = data.conversations || [];
+      setConversations(items);
+      if (items[0]) await loadConversation(items[0].id);
+      else handleNewConversation();
+    } catch (error) {
+      console.error('[ChatHistory] Unable to clear conversation:', error);
+      setMessages(prev => [...prev, { role: 'assistant', text: 'Unable to clear this conversation.' }]);
+    }
+  };
 
   // Auto-scroll chat to bottom when messages change
   useEffect(() => {
@@ -784,7 +882,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
   const sendAssistantRequest = async (payload) => {
     const baseBody = {
       selectedApps: selectedAppIds,
-      conversationHistory: messages.slice(-10),
+      conversationId: activeConversationId,
       ...payload,
     };
 
@@ -947,6 +1045,11 @@ function App({ initialWorkspace, onWorkspaceChange }) {
             followupContext,
           });
 
+          if (data.conversationId) {
+            setActiveConversationId(data.conversationId);
+            refreshConversationList(data.conversationId);
+          }
+
           console.log('[App] Response data:', JSON.stringify(data));
 
           if (data.type === 'followup' || data.type === 'needs_info') {
@@ -1018,6 +1121,11 @@ function App({ initialWorkspace, onWorkspaceChange }) {
       }
 
       const data = await sendAssistantRequest(requestBody);
+
+      if (data.conversationId) {
+        setActiveConversationId(data.conversationId);
+        refreshConversationList(data.conversationId);
+      }
 
       // Handle follow-up questions from Composio (backend sends 'needs_info' or 'followup')
       if (data.type === 'followup' || data.type === 'needs_info') {
@@ -1504,14 +1612,48 @@ function App({ initialWorkspace, onWorkspaceChange }) {
 
                   {/* Chat history */}
                   <div className="mt-6 border border-white/10 rounded-2xl bg-black/70 backdrop-blur-xl p-4 max-h-72 overflow-y-auto">
-                    {messages.length === 0 ? (
+                    <div className="sticky top-0 z-10 mb-3 flex items-center gap-2 bg-black/90 pb-3 border-b border-white/10">
+                      <select
+                        value={activeConversationId || ''}
+                        onChange={(event) => loadConversation(event.target.value)}
+                        className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-white"
+                        aria-label="Conversation history"
+                      >
+                        <option value="">New conversation</option>
+                        {conversations.map(item => (
+                          <option key={item.id} value={item.id} className="bg-gray-900">
+                            {item.title}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={handleNewConversation}
+                        className="p-2 rounded-lg bg-white/10 hover:bg-white/20 text-white"
+                        title="New conversation"
+                        aria-label="New conversation"
+                      >
+                        <MessageSquarePlus className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={handleDeleteConversation}
+                        disabled={!activeConversationId}
+                        className="p-2 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-300 disabled:opacity-30"
+                        title="Clear current conversation"
+                        aria-label="Clear current conversation"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                    {historyLoading ? (
+                      <p className="text-xs text-white/50">Loading conversation...</p>
+                    ) : messages.length === 0 ? (
                       <p className="text-xs text-white/60">
                         Try something like: "Open the Frappe Cloud welcome page, summarize what you see, send that summary to Slack, and schedule a meeting at 3pm today."
                       </p>
                     ) : (
                       messages.map((m, idx) => (
                         <div
-                          key={idx}
+                          key={m.id || idx}
                           className={`mb-3 flex ${m.role === 'user' ? 'justify-end' : 'justify-start'
                             }`}
                         >

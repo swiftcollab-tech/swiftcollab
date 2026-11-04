@@ -11,6 +11,7 @@
     "test:integration-provider": "node tests/integrationProvider.test.js",
     "test:organizations": "node tests/organizationService.test.js",
     "test:organization-invitations": "node tests/organizationInvitation.integration.test.js",
+    "test:chat-history": "node tests/conversationService.integration.test.js",
     "test:interview-scheduling": "node tests/interviewSchedulingService.test.js",
     "test:google-workspace": "node tests/googleWorkspaceSecurity.test.js",
     "test:automatic-scheduling": "node tests/automaticInterviewSchedulingService.test.js"

@@ -238,6 +238,14 @@ export const organizationApi = {
   removeMember: (organizationId, userId) => api.delete(`/api/organizations/${organizationId}/members/${userId}`),
 };
 
+export const conversationApi = {
+  list: () => api.get('/api/conversations'),
+  create: (title = 'New conversation') => api.post('/api/conversations', { title }),
+  messages: (conversationId, limit = 100) => api.get(`/api/conversations/${conversationId}/messages?limit=${limit}`),
+  remove: (conversationId) => api.delete(`/api/conversations/${conversationId}`),
+  clearAll: () => api.delete('/api/conversations'),
+};
+
 // Sprint 1: read-only interview scheduling proposals. No external write APIs exist here.
 export const interviewSchedulingApi = {
   getConfiguration: () => api.get('/api/interview-scheduling/configuration'),

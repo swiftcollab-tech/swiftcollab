@@ -9,6 +9,23 @@ const express = require("express");
 const { APP_TO_COMPOSIO_TOOLKIT } = require("../composioService");
 const { frappeConnectionManager } = require("../integrations/frappe");
 const { requireOrganization } = require('../middleware/organization');
+const { conversationService } = require('../services/conversationService');
+
+function assistantMessageText(result) {
+  return String(
+    result?.message || result?.response || result?.reply || 'Request processed.'
+  );
+}
+
+function assistantMessageMetadata(result) {
+  if (!result || typeof result !== 'object') return {};
+  const metadata = { ...result };
+  delete metadata.message;
+  delete metadata.response;
+  delete metadata.reply;
+  delete metadata.conversationId;
+  return metadata;
+}
 
 function normalizeSelectedToolkits({ selectedApps, selectedToolkits, appsQuery }) {
   if (Array.isArray(selectedToolkits) && selectedToolkits.length > 0) return selectedToolkits;
@@ -51,6 +68,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
   // ---------------------------------------------------------------------------
 
   async function handleAssistant(req, res) {
+    let activeConversation = null;
     try {
       const {
         message,
@@ -58,7 +76,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         selectedToolkits,
         followupContext,
         answers,
-        conversationHistory,
+        conversationId,
         userResponse,
       } = req.body || {};
 
@@ -75,6 +93,39 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
 
       const effectiveMessage = typeof userResponse === "string" && userResponse.length > 0 ? userResponse : message;
 
+      if (typeof effectiveMessage !== 'string' || !effectiveMessage.trim()) {
+        return res.status(400).json({ type: 'error', message: 'Message is required.' });
+      }
+
+      activeConversation = conversationId
+        ? await conversationService.getConversation({
+          organizationId: req.organization.organization_id,
+          userId,
+          conversationId,
+        })
+        : await conversationService.createConversation({
+          organizationId: req.organization.organization_id,
+          userId,
+          title: effectiveMessage,
+        });
+
+      // The database, not browser-provided history, is the trusted source of
+      // conversation context. Fetch prior turns before appending this turn so
+      // the current prompt is not sent to the LLM twice.
+      const priorMessages = await conversationService.listMessages({
+        organizationId: req.organization.organization_id,
+        userId,
+        conversationId: activeConversation.id,
+        limit: 20,
+      });
+      await conversationService.addMessage({
+        organizationId: req.organization.organization_id,
+        userId,
+        conversationId: activeConversation.id,
+        role: 'user',
+        content: effectiveMessage,
+      });
+
       const result = await assistantOrchestrator.processPrompt({
         message: effectiveMessage,
         userId,
@@ -82,13 +133,30 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         selectedToolkits: normalizedToolkits,
         followupContext: followupContext || null,
         answers: answers || [],
-        conversationHistory: conversationHistory || [],
+        conversationHistory: priorMessages.map(item => ({
+          role: item.role,
+          text: item.content,
+        })),
       });
 
-      return res.json(result);
+      await conversationService.addMessage({
+        organizationId: req.organization.organization_id,
+        userId,
+        conversationId: activeConversation.id,
+        role: 'assistant',
+        content: assistantMessageText(result),
+        metadata: assistantMessageMetadata(result),
+      });
+
+      return res.json({ ...result, conversationId: activeConversation.id });
     } catch (error) {
       console.error("[Orchestration] Assistant error:", error);
-      return res.status(500).json({ type: "error", message: error.message });
+      const status = error.statusCode || 500;
+      return res.status(status).json({
+        type: "error",
+        message: error.message,
+        ...(activeConversation ? { conversationId: activeConversation.id } : {}),
+      });
     }
   }
 

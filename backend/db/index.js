@@ -110,6 +110,11 @@ async function initializeDatabase() {
     await pool.query(schema);
     console.log('[DB] Database schema initialized');
 
+    // Apply organization and feature migrations before extension schemas that
+    // reference those tables. Dynamic loading avoids a module cycle at startup.
+    const { runMigrations } = require('./migrate');
+    await runMigrations();
+
     // Initialize orchestration schema
     const orchestrationSchemaPath = path.join(__dirname, 'orchestration-schema.sql');
     if (fs.existsSync(orchestrationSchemaPath)) {

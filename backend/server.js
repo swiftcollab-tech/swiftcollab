@@ -55,6 +55,7 @@ const authRoutes = require('./routes/auth');
 const workspaceRoutes = require('./routes/workspace');
 const frappeRoutes = require('./routes/frappe');
 const organizationRoutes = require('./routes/organizations');
+const conversationRoutes = require('./routes/conversations');
 const interviewSchedulingRoutes = require('./routes/interviewScheduling');
 const googleWorkspaceRoutes = require('./routes/googleWorkspace');
 const { startAutomaticInterviewSchedulingJob, stopAutomaticInterviewSchedulingJob } = require('./jobs/automaticInterviewSchedulingJob');
@@ -401,6 +402,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/workspace', workspaceRoutes);
 app.use('/api/frappe', frappeRoutes);
 app.use('/api/organizations', organizationRoutes);
+app.use('/api/conversations', conversationRoutes);
 app.use('/api/interview-scheduling', interviewSchedulingRoutes);
 app.use('/api/integrations/google', googleWorkspaceRoutes);
 
