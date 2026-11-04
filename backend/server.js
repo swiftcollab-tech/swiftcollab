@@ -70,13 +70,21 @@ const { sanitizeBody } = require('./middleware/validation');
 // Configuration
 // -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 4002;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const RENDER_APP_URL = process.env.RENDER_EXTERNAL_HOSTNAME
+  ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
+  : null;
+const FRONTEND_URL = process.env.FRONTEND_URL || RENDER_APP_URL || 'http://localhost:5173';
+// Routes that generate invitation and OAuth callback links read APP_URL
+// directly. Give them the deployed Render URL when no explicit custom domain
+// has been configured yet.
+if (!process.env.APP_URL) process.env.APP_URL = FRONTEND_URL;
 const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'auto').toLowerCase();
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || '127.0.0.1:7233';
+const TEMPORAL_ENABLED = process.env.TEMPORAL_ENABLED !== 'false';
 const ALLOWED_ORIGINS = new Set([
   FRONTEND_URL,
   ...(process.env.CORS_ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean),
@@ -351,6 +359,12 @@ app.get('/api/health', async (_req, res) => {
   res.status(health.status === 'ok' ? 200 : 503).json(health);
 });
 
+// Liveness only proves the HTTP process is running. Render should not restart
+// the service merely because an optional dependency is temporarily degraded.
+app.get('/api/health/live', (_req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 app.get('/api/health/detailed', authenticateToken, async (_req, res) => {
   const redisStatus = redis.getStatus();
 
@@ -512,18 +526,22 @@ async function bootstrapOrchestration() {
 
   // Step 6: Start Temporal Worker (non-blocking)
   console.log('[6/6] Starting Temporal worker...');
-  try {
-    await initTemporalClient(TEMPORAL_ADDRESS);
-    await startTemporalWorker({
-      composio: composioService,
-      callGemini,
-      query,
-      temporalAddress: TEMPORAL_ADDRESS,
-    });
-    console.log('      Temporal worker running');
-  } catch (err) {
-    console.warn('      Temporal not available:', err.message);
-    console.warn('      (Executor will use direct execution fallback)');
+  if (!TEMPORAL_ENABLED) {
+    console.log('      Temporal disabled - using direct execution fallback');
+  } else {
+    try {
+      await initTemporalClient(TEMPORAL_ADDRESS);
+      await startTemporalWorker({
+        composio: composioService,
+        callGemini,
+        query,
+        temporalAddress: TEMPORAL_ADDRESS,
+      });
+      console.log('      Temporal worker running');
+    } catch (err) {
+      console.warn('      Temporal not available:', err.message);
+      console.warn('      (Executor will use direct execution fallback)');
+    }
   }
 
   console.log('\n========================================');
@@ -600,6 +618,17 @@ async function main() {
     app.use('/api/*', (_req, res) => {
       res.status(404).json({ error: 'Endpoint not found' });
     });
+
+    // The production service hosts the Vite build and API together. This
+    // catch-all supports client-side routing without interfering with /api.
+    if (process.env.NODE_ENV === 'production') {
+      const frontendDist = path.join(__dirname, '..', 'dist');
+      app.use(express.static(frontendDist));
+      app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api/')) return next();
+        return res.sendFile(path.join(frontendDist, 'index.html'));
+      });
+    }
 
     // Global error handler
     app.use((err, _req, res, _next) => {

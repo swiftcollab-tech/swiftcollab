@@ -8,7 +8,11 @@
  * - Retry logic
  */
 
-export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4002';
+// In development Vite and the API run on different ports. In production the
+// Express service also serves the built React app, so relative API URLs keep
+// authentication cookies on the same origin.
+export const API_URL = import.meta.env.VITE_API_URL
+  || (import.meta.env.DEV ? 'http://localhost:4002' : '');
 
 class ApiError extends Error {
   constructor(message, status, data) {
