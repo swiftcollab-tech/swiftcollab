@@ -894,8 +894,16 @@ class ActionResultFormatter {
             lines.push(`${ok ? "✅" : "❌"} ${labelFor(t)}${!ok && c.authUrl ? ` — Connect: ${c.authUrl}` : ""}`);
         }
 
+        if (lines.length === 0) {
+            return {
+                summary: "No connected apps were found for your account.",
+                details: "Open Integrations to connect an app, then ask me to check again.",
+                structured: { connections, missing },
+            };
+        }
+
         return {
-            summary: missing && missing.length ? "Some apps are not connected." : "All selected apps are connected.",
+            summary: missing && missing.length ? "Some requested apps are not connected." : "Here are your connected apps.",
             details: lines.join("\n") || null,
             structured: { connections, missing },
         };

@@ -20,11 +20,12 @@
  */
 
 class ToolRouter {
-  constructor({ composioToolSet, callGemini, frappeService = null, query = null, options = {} }) {
+  constructor({ composioToolSet, connectorService = null, callGemini, frappeService = null, query = null, options = {} }) {
     if (!composioToolSet) throw new Error("composioToolSet required");
     if (!callGemini) throw new Error("callGemini required");
 
     this.composioToolSet = composioToolSet;
+    this.connectorService = connectorService;
     this.callGemini = callGemini;
     this.frappeService = frappeService;
     this.query = query; // Database query function for entity resolution
@@ -47,6 +48,8 @@ class ToolRouter {
 
     // Safety limits
     this.MAX_TOOLS_PER_TOOLKIT = options.maxToolsPerToolkit ?? 80;
+    this.MAX_ROUTER_CANDIDATES = options.maxRouterCandidates ?? 30;
+    this.MAX_RELEVANT_TOOLKITS = options.maxRelevantToolkits ?? 10;
     this.MAX_ENABLED_TOOLKITS = Number.isFinite(options.maxEnabledToolkits)
       ? options.maxEnabledToolkits
       : null;
@@ -323,9 +326,6 @@ class ToolRouter {
       ? (enabledToolkits || []).slice(0, this.MAX_ENABLED_TOOLKITS)
       : (enabledToolkits || []);
 
-    // 0) Fetch tools dynamically (cached) - pass context for Frappe per-user tools
-    const availableTools = await this.getToolsFromComposio(trimmedToolkits, context.entityId, context);
-
     // Fast-path: user is asking about integration/connection status
     if (this._looksLikeConnectionStatusQuery(message)) {
       return {
@@ -349,6 +349,27 @@ class ToolRouter {
       };
     }
 
+    // Only connected applications may contribute tools. This is enforced on
+    // the server even if a browser sends stale or manipulated selections.
+    const connectedToolkits = await this._connectedToolkits(trimmedToolkits, context);
+    if (connectedToolkits.length === 0) {
+      return this._chatRoutingResult(
+        'I could not find a connected app for that request. Connect the app first, then try again.'
+      );
+    }
+
+    // With many connected apps, first select app categories using only their
+    // names. This keeps hundreds of unrelated action schemas away from the LLM.
+    const relevantToolkits = await this._selectRelevantToolkits(
+      message,
+      connectedToolkits,
+      context
+    );
+
+    // Fetch schemas only after intent gating and connected-app filtering.
+    const allConnectedTools = await this.getToolsFromComposio(relevantToolkits, context.entityId, context);
+    const availableTools = this._shortlistTools(message, allConnectedTools);
+
     console.log(
       "[ToolRouter] Routing message:",
       String(message || "").substring(0, 80) + (String(message || "").length > 80 ? "..." : "")
@@ -357,11 +378,14 @@ class ToolRouter {
       "[ToolRouter] Available tools:",
       availableTools.length,
       "tools from",
-      trimmedToolkits.join(", ")
+      relevantToolkits.join(", "),
+      `(shortlisted from ${allConnectedTools.length})`
     );
 
-    // 1) Stage A: choose tool names + sequences only (small prompt)
-    const stageA = await this._stageA_selectTools({ message, availableTools, context });
+    // 1) Resolve high-confidence intents deterministically; use the model for
+    // ambiguous and multi-step planning only.
+    const stageA = this._deterministicToolSelection(message, availableTools) ||
+      await this._stageA_selectTools({ message, availableTools, context });
 
     // Chat-only response
     if (stageA.selectedTools.length === 1 && stageA.selectedTools[0].name === "chat_response") {
@@ -438,6 +462,7 @@ class ToolRouter {
     const connectionResult = await this._validateConnections({
       selectedTools: stageA.selectedTools,
       entityId: context.entityId,
+      context,
     });
 
     if (connectionResult.needsConnection) {
@@ -557,7 +582,290 @@ class ToolRouter {
   // CONNECTION VALIDATION
   // ===========================================================================
 
-  async _validateConnections({ selectedTools, entityId }) {
+  _chatRoutingResult(chatResponse) {
+    return {
+      success: true,
+      tools: [{
+        name: 'chat_response',
+        params: { response_type: 'general' },
+        composio_action: null,
+        sequence: 1,
+      }],
+      isMultiTool: false,
+      needsMoreInfo: false,
+      needsConnection: false,
+      missingParams: [],
+      clarificationQuestion: null,
+      chatResponse,
+      _preflight: null,
+      _connections: null,
+    };
+  }
+
+  async _connectedToolkits(requestedToolkits, context = {}) {
+    const requested = [...new Set((requestedToolkits || []).map(value => String(value).toUpperCase()))];
+    const composioRequested = requested.filter(toolkit => toolkit !== 'FRAPPE');
+    const allowed = new Set();
+    let discovered = [];
+
+    if (context.entityId) {
+      const connectedApps = await this.composioToolSet.getConnectedApps(context.entityId);
+      const connected = new Set((connectedApps || []).map(app => String(app.toolkit || '').toUpperCase()));
+      discovered = [...connected];
+      for (const toolkit of composioRequested) {
+        if (connected.has(toolkit)) allowed.add(toolkit);
+      }
+    }
+
+    // Native connectors participate in the same routing decision. Only
+    // adapters with implemented action execution are advertised here; a
+    // connection-only adapter must not cause the router to choose tools it
+    // cannot execute.
+    if (this.connectorService && context.organizationId) {
+      const nativeCandidates = requested.length > 0
+        ? requested.filter(toolkit => toolkit !== 'FRAPPE')
+        : this.connectorService.listCatalog()
+          .filter(item => item.providers?.direct?.status === 'available')
+          .map(item => item.toolkit);
+      for (const toolkit of nativeCandidates) {
+        if (!this.connectorService.canExecuteDirect(toolkit)) continue;
+        try {
+          const direct = await this.connectorService.getDirectStatus({
+            appId: toolkit,
+            organizationId: context.organizationId,
+            userId: context.userId,
+          });
+          if (direct.connected) {
+            allowed.add(toolkit);
+            discovered.push(toolkit);
+          }
+        } catch (error) {
+          console.warn(`[ToolRouter] Unable to verify native ${toolkit} connection:`, error.message);
+        }
+      }
+    }
+
+    if (requested.length === 0 || requested.includes('FRAPPE')) {
+      try {
+        if (await this._hasConnectedFrappe(context)) {
+          if (requested.length === 0) discovered.push('FRAPPE');
+          else allowed.add('FRAPPE');
+        }
+      } catch (error) {
+        console.warn('[ToolRouter] Unable to verify Frappe connection:', error.message);
+      }
+    }
+
+    if (requested.length === 0) return [...new Set(discovered)];
+
+    const filtered = requested.filter(toolkit => allowed.has(toolkit));
+    const omitted = requested.filter(toolkit => !allowed.has(toolkit));
+    if (omitted.length > 0) {
+      console.log(`[ToolRouter] Ignoring unconnected toolkits: ${omitted.join(', ')}`);
+    }
+    return filtered;
+  }
+
+  async _hasConnectedFrappe(context = {}) {
+    const { frappeConnectionManager } = require('../integrations/frappe');
+    const userId = context.userId || this._extractUserId(context.entityId);
+    const perUserConnected = userId
+      ? await frappeConnectionManager.hasActiveConnection(userId)
+      : false;
+    return perUserConnected || Boolean(this.frappeService?.isConfigured?.());
+  }
+
+  _toolkitSearchTerms(toolkit) {
+    const normalized = String(toolkit || '').toUpperCase();
+    const aliases = {
+      GOOGLECALENDAR: ['google calendar', 'calendar', 'meeting', 'event', 'reminder'],
+      GMAIL: ['gmail', 'email', 'mail'],
+      OUTLOOK: ['outlook', 'email', 'calendar', 'meeting'],
+      GITHUB: ['github', 'repository', 'repo', 'pull request', 'commit'],
+      GITLAB: ['gitlab', 'repository', 'repo', 'merge request', 'commit'],
+      BITBUCKET: ['bitbucket', 'repository', 'repo', 'pull request'],
+      SLACK: ['slack', 'channel', 'message'],
+      MICROSOFTTEAMS: ['microsoft teams', 'teams', 'channel', 'meeting'],
+      DISCORD: ['discord', 'channel', 'message'],
+      JIRA: ['jira', 'issue', 'ticket', 'bug', 'story'],
+      LINEAR: ['linear', 'issue', 'ticket'],
+      ASANA: ['asana', 'task', 'project'],
+      TRELLO: ['trello', 'board', 'card'],
+      CLICKUP: ['clickup', 'task', 'project'],
+      NOTION: ['notion', 'page', 'database', 'document'],
+      GOOGLEDRIVE: ['google drive', 'drive', 'file', 'document'],
+      GOOGLEDOCS: ['google docs', 'document'],
+      DROPBOX: ['dropbox', 'file'],
+      HUBSPOT: ['hubspot', 'contact', 'deal', 'company'],
+      SALESFORCE: ['salesforce', 'lead', 'contact', 'opportunity', 'account'],
+      ZENDESK: ['zendesk', 'support ticket', 'ticket'],
+      ZOOM: ['zoom', 'meeting', 'call'],
+      FRAPPE: ['frappe', 'erpnext', 'customer', 'invoice', 'sales order'],
+    };
+    return [normalized.toLowerCase().replaceAll('_', ' '), ...(aliases[normalized] || [])];
+  }
+
+  _toolkitBrandTerms(toolkit) {
+    const normalized = String(toolkit || '').toUpperCase();
+    const brands = {
+      GOOGLECALENDAR: ['google calendar'],
+      GMAIL: ['gmail'],
+      OUTLOOK: ['outlook'],
+      GITHUB: ['github'],
+      GITLAB: ['gitlab'],
+      BITBUCKET: ['bitbucket'],
+      SLACK: ['slack'],
+      MICROSOFTTEAMS: ['microsoft teams', 'teams'],
+      DISCORD: ['discord'],
+      JIRA: ['jira'],
+      LINEAR: ['linear'],
+      ASANA: ['asana'],
+      TRELLO: ['trello'],
+      CLICKUP: ['clickup'],
+      NOTION: ['notion'],
+      GOOGLEDRIVE: ['google drive'],
+      GOOGLEDOCS: ['google docs'],
+      DROPBOX: ['dropbox'],
+      HUBSPOT: ['hubspot'],
+      SALESFORCE: ['salesforce'],
+      ZENDESK: ['zendesk'],
+      ZOOM: ['zoom'],
+      FRAPPE: ['frappe', 'erpnext'],
+    };
+    return brands[normalized] || [normalized.toLowerCase().replaceAll('_', ' ')];
+  }
+
+  _uniqueCapabilityMatches(message, connectedToolkits) {
+    const groups = [
+      { pattern: /\b(email|mail|send an? email)\b/i, toolkits: ['GMAIL', 'OUTLOOK', 'SENDGRID'] },
+      { pattern: /\b(calendar|schedule|meeting|event|remind|reminder)\b/i, toolkits: ['GOOGLECALENDAR', 'OUTLOOK', 'ZOOM'] },
+      { pattern: /\b(repository|repo|pull request|merge request|commit)\b/i, toolkits: ['GITHUB', 'GITLAB', 'BITBUCKET'] },
+      { pattern: /\b(channel|chat message|notify the team)\b/i, toolkits: ['SLACK', 'MICROSOFTTEAMS', 'DISCORD'] },
+      { pattern: /\b(file|document|folder)\b/i, toolkits: ['GOOGLEDRIVE', 'GOOGLEDOCS', 'DROPBOX', 'NOTION'] },
+    ];
+    const connected = new Set(connectedToolkits);
+    const matches = [];
+    for (const group of groups) {
+      if (!group.pattern.test(message)) continue;
+      const candidates = group.toolkits.filter(toolkit => connected.has(toolkit));
+      if (candidates.length === 1) matches.push(candidates[0]);
+    }
+    return matches;
+  }
+
+  async _selectRelevantToolkits(message, connectedToolkits, context = {}) {
+    const connected = [...new Set((connectedToolkits || []).map(value => String(value).toUpperCase()))];
+    if (connected.length <= 1) return connected;
+
+    const text = String(message || '').toLowerCase();
+    const explicitMatches = connected.filter(toolkit =>
+      this._toolkitBrandTerms(toolkit).some(term => term && text.includes(term))
+    );
+    const deterministicMatches = [...new Set([
+      ...explicitMatches,
+      ...this._uniqueCapabilityMatches(message, connected),
+    ])];
+
+    // Explicit cross-app requests are deterministic and require no extra LLM call.
+    if (deterministicMatches.length > 0) {
+      return deterministicMatches.slice(0, this.MAX_RELEVANT_TOOLKITS);
+    }
+
+    const systemPrompt = `Select the connected SwiftCollab apps needed for this work request.
+Connected app toolkits: ${JSON.stringify(connected)}
+Return JSON only: {"toolkits":["EXACT_TOOLKIT_NAME"]}
+Choose only connected names. Usually choose 1-3 apps. Include multiple apps only when the request transfers data or performs actions across them.`;
+
+    try {
+      const response = await this.callGemini(systemPrompt, message, 0);
+      const parsed = this._parseJson(response) || {};
+      const allowed = new Set(connected);
+      const selected = [...new Set((parsed.toolkits || [])
+        .map(value => String(value || '').toUpperCase())
+        .filter(value => allowed.has(value)))];
+      if (selected.length > 0) return selected.slice(0, this.MAX_RELEVANT_TOOLKITS);
+    } catch (error) {
+      console.warn('[ToolRouter] App selection model failed:', error.message);
+    }
+
+    // Safe fallback: keep a small set instead of expanding every connected app.
+    console.warn('[ToolRouter] Could not identify a specific app; using a limited connected-app fallback');
+    return connected.slice(0, Math.min(3, this.MAX_RELEVANT_TOOLKITS));
+  }
+
+  _shortlistTools(message, tools) {
+    const systemTools = tools.filter(tool => ['chat_response', 'SYSTEM_CHECK_CONNECTIONS'].includes(tool.name));
+    const candidates = tools.filter(tool => !systemTools.includes(tool));
+    if (candidates.length <= this.MAX_ROUTER_CANDIDATES) return tools;
+
+    const stopWords = new Set(['the', 'a', 'an', 'to', 'for', 'from', 'in', 'on', 'of', 'my', 'our', 'please', 'and']);
+    const tokens = String(message || '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(token => token.length > 1 && !stopWords.has(token));
+
+    const score = tool => {
+      const haystack = `${tool.name || ''} ${tool.description || ''}`.toLowerCase().replaceAll('_', ' ');
+      let value = 0;
+      for (const token of tokens) {
+        if (haystack.includes(token)) value += tool.name?.toLowerCase().includes(token) ? 4 : 2;
+      }
+      if (/\b(list|show|find|search|get|fetch|read)\b/i.test(message) && /list|search|find|get|fetch|read/.test(haystack)) value += 3;
+      if (/\b(create|add|new|set|schedule|remind)\b/i.test(message) && /create|add|schedule|event|remind/.test(haystack)) value += 3;
+      if (/\b(update|edit|change)\b/i.test(message) && /update|edit/.test(haystack)) value += 3;
+      if (/\b(delete|remove)\b/i.test(message) && /delete|remove/.test(haystack)) value += 3;
+      return value;
+    };
+
+    const ranked = candidates
+      .map((tool, index) => ({ tool, index, score: score(tool) }))
+      .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    // Reserve capacity for every relevant app. A global top-N can otherwise
+    // fill entirely with one toolkit and break cross-app workflows.
+    const toolkitCount = new Set(ranked.map(item => item.tool.toolkit).filter(Boolean)).size || 1;
+    const perToolkitLimit = toolkitCount === 1 ? 10 : toolkitCount <= 3 ? 6 : 3;
+    const perToolkitCounts = new Map();
+    const balanced = [];
+    for (const item of ranked) {
+      const toolkit = item.tool.toolkit || 'UNKNOWN';
+      const count = perToolkitCounts.get(toolkit) || 0;
+      if (count >= perToolkitLimit) continue;
+      balanced.push(item.tool);
+      perToolkitCounts.set(toolkit, count + 1);
+      if (balanced.length >= this.MAX_ROUTER_CANDIDATES) break;
+    }
+
+    return [...balanced, ...systemTools];
+  }
+
+  _deterministicToolSelection(message, availableTools) {
+    const text = String(message || '');
+    const isReminderRequest = /\b(remind|reminder|set|schedule|add|create)\b/i.test(text) &&
+      /\b(tomorrow|today|tonight|calendar|meeting|event|remind|reminder|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i.test(text);
+    if (!isReminderRequest) return null;
+
+    const calendarCreate = (availableTools || []).find(tool => {
+      const name = String(tool.name || '').toUpperCase();
+      const description = String(tool.description || '').toLowerCase();
+      return name.startsWith('GOOGLECALENDAR_') &&
+        ((name.includes('CREATE') && name.includes('EVENT')) ||
+          (description.includes('create') && description.includes('event')));
+    });
+    if (!calendarCreate) return null;
+
+    return {
+      selectedTools: [{
+        name: calendarCreate.name,
+        sequence: 1,
+        usePreviousOutput: false,
+      }],
+      chatResponse: null,
+      deterministic: true,
+    };
+  }
+
+  async _validateConnections({ selectedTools, entityId, context = {} }) {
     const result = {
       needsConnection: false,
       connections: {},
@@ -641,6 +949,22 @@ class ToolRouter {
         // Unknown toolkit, assume it works
         result.connections[toolkit] = { connected: true, unknown: true };
         continue;
+      }
+
+      if (this.connectorService?.canExecuteDirect(toolkit) && context.organizationId) {
+        try {
+          const direct = await this.connectorService.getDirectStatus({
+            appId: toolkit,
+            organizationId: context.organizationId,
+            userId: context.userId,
+          });
+          if (direct.connected) {
+            result.connections[toolkit] = { ...direct, direct: true };
+            continue;
+          }
+        } catch (error) {
+          console.warn(`[ToolRouter] Native ${toolkit} connection check failed:`, error.message);
+        }
       }
 
       // Check cache first
@@ -1790,27 +2114,42 @@ class ToolRouter {
       return cached.tools;
     }
 
-    const tools = [];
-
-    for (const toolkit of toolkits) {
+    const toolkitResults = await Promise.all(toolkits.map(async toolkit => {
       try {
         // Handle FRAPPE specially - fetch from FrappeSchemaService
         if (toolkit.toUpperCase() === 'FRAPPE') {
           const frappeTools = await this._getFrappeTools(context.userId);
-          tools.push(...frappeTools);
-          continue;
+          return frappeTools;
+        }
+
+        if (this.connectorService?.canExecuteDirect(toolkit) && context.organizationId) {
+          const directStatus = await this.connectorService.getDirectStatus({
+            appId: toolkit,
+            organizationId: context.organizationId,
+            userId: context.userId,
+          });
+          if (directStatus.connected) {
+            const directTools = this.connectorService.getDirectTools(toolkit);
+            if (directTools.length) {
+              return directTools.map(tool => this.normalizeSchema(tool, toolkit));
+            }
+          }
         }
 
         // Use getToolsForToolkit which is the method available in ComposioService
         const result = await this.composioToolSet.getToolsForToolkit(toolkit, entityId);
         if (result?.length) {
           const normalized = result.map((t) => this.normalizeSchema(t, toolkit));
-          tools.push(...normalized.slice(0, this.MAX_TOOLS_PER_TOOLKIT));
+          return normalized.slice(0, this.MAX_TOOLS_PER_TOOLKIT);
         }
+        return [];
       } catch (err) {
         console.warn(`[ToolRouter] Failed to fetch ${toolkit}:`, err.message);
+        return [];
       }
-    }
+    }));
+
+    const tools = toolkitResults.flat();
 
     tools.push(this.systemCheckTool());
     tools.push(this.chatTool());
@@ -2017,10 +2356,12 @@ class ToolRouter {
     const s = String(message || "").toLowerCase();
     if (!s) return false;
     const hasConnectionWord = /\b(connect(?:ed|ion)?|integrations?|oauth|auth|linked)\b/i.test(s);
-    const hasCheckWord = /\b(check|status|verify|cross\s*check|working|configured)\b/i.test(s);
+    const hasCheckWord = /\b(check|status|verify|cross\s*check|working|configured|list|which|what|show|give)\b/i.test(s);
     // Also match direct "are my apps connected"
     const hasAppsWord = /\b(apps?|tools?)\b/i.test(s);
-    return (hasConnectionWord && (hasCheckWord || hasAppsWord)) || /\bwhat(?:'s| is)\s+connected\b/i.test(s);
+    return (hasConnectionWord && (hasCheckWord || hasAppsWord)) ||
+      /\b(what|which)(?:'s| is| are)?\s+connected\b/i.test(s) ||
+      /\bconnected\s+(apps?|tools?|accounts?|integrations?)\b/i.test(s);
   }
 
   // ===========================================================================
@@ -2028,6 +2369,38 @@ class ToolRouter {
   // ===========================================================================
 
   async _stageA_selectTools({ message, availableTools, context }) {
+    const now = this._nowContext();
+    const shortlist = availableTools
+      .filter(tool => !tool.name.includes('JQL') && !tool.name.includes('_JQL_'))
+      .map(tool => ({ name: tool.name, description: tool.description, toolkit: tool.toolkit }));
+
+    const systemPrompt = `You route SwiftCollab work requests to connected-app tools.
+
+Time: ${now.nowRfc3339} (${this.USER_TIMEZONE})
+Available tools:
+${JSON.stringify(shortlist)}
+
+Choose only exact names from the list. Include every step needed for the request. Use the same sequence for independent parallel steps and increasing sequences for dependent steps. Set usePreviousOutput=true when a later step consumes earlier results. If none matches, select chat_response. Return JSON only:
+{"selectedTools":[{"name":"EXACT_NAME","sequence":1,"usePreviousOutput":false}],"chatResponse":null}`;
+
+    const response = await this.callGemini(systemPrompt, message, 0);
+    const parsed = this._parseJson(response) || {};
+    let selectedTools = Array.isArray(parsed.selectedTools) ? parsed.selectedTools : [];
+    if (!selectedTools.length) selectedTools = [{ name: 'chat_response', sequence: 1 }];
+
+    selectedTools = selectedTools
+      .map((tool, index) => ({
+        name: String(tool.name || '').trim(),
+        sequence: Number.isFinite(tool.sequence) ? tool.sequence : index + 1,
+        usePreviousOutput: Boolean(tool.usePreviousOutput),
+      }))
+      .filter(tool => tool.name)
+      .sort((a, b) => a.sequence - b.sequence);
+
+    return { selectedTools, chatResponse: parsed.chatResponse || null };
+  }
+
+  async _stageA_selectToolsLegacy({ message, availableTools, context }) {
     const now = this._nowContext();
 
     // Filter out JQL-based Jira actions - they require complex query syntax users don't know
@@ -2390,6 +2763,8 @@ CHAINING RULES:
 CRITICAL - DO NOT INVENT VALUES:
 - NEVER make up project_key, issue_key, board_id, channel_id, or any identifier
 - NEVER invent email addresses - only use emails explicitly provided in the user's message
+- Preserve user-provided names, titles, places, and wording exactly; do not autocorrect or replace them
+- Example: "go to saloon" must remain "go to saloon" and must not become "Sally's salon"
 - If a required field's value is not in the user's message, leave it as null or empty string
 - The SlotFiller will ask the user for any missing required values
 - Example: If user says "send jira tickets" but doesn't specify which project, set project_key: null (NOT "PROJ-123")
@@ -2402,6 +2777,8 @@ CALENDAR EVENT RULES:
   * end_datetime: ONLY set if user provides duration/end time, otherwise set null
 - If user says "schedule a meeting with X" without time, set start_datetime: null, end_datetime: null
 - For attendees: extract ALL email addresses mentioned, use array format: attendees: ["email1@x.com", "email2@y.com"]
+- For reminders, use the requested activity as summary after removing only date/time words
+- Example: "set a reminder tomorrow at 10 am go to saloon" → summary: "go to saloon"
 
 OUTPUT JSON ONLY:
 {

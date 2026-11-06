@@ -62,8 +62,13 @@ Be conversational, helpful, and concise (2-3 sentences).`;
           .join("\n")}`
         : "";
 
-    const response = await this.callGemini(systemPrompt + historyContext, message, 0.7);
-    return String(response || "").trim();
+    try {
+      const response = await this.callGemini(systemPrompt + historyContext, message, 0.7);
+      return String(response || "").trim() || "How can I help?";
+    } catch (error) {
+      console.warn('[AssistantComposer] Chat model unavailable:', error.message);
+      return "I can help answer questions or work with your connected apps. What would you like to do?";
+    }
   }
 
   async composeExecution({ originalMessage, executionResult, timezone = "America/New_York" }) {

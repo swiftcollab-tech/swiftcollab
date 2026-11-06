@@ -56,7 +56,7 @@ function determineEventType(app, payload) {
   }
 }
 
-function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optionalAuth, composioService = null) {
+function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optionalAuth, composioService = null, connectorService = null) {
   const router = express.Router();
 
   if (!assistantOrchestrator) {
@@ -67,7 +67,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
   // Assistant endpoints (back-compat)
   // ---------------------------------------------------------------------------
 
-  async function handleAssistant(req, res) {
+  async function runAssistant(req, emit = async () => {}) {
     let activeConversation = null;
     try {
       const {
@@ -86,18 +86,15 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
       const entityId = `user_${userId}`;
 
       const normalizedToolkits = normalizeSelectedToolkits({ selectedApps, selectedToolkits });
-      if (normalizedToolkits.length === 0) {
-        return res.json({
-          type: "error",
-          message: "Please drag at least one app into AI OS or Work OS before running commands.",
-        });
-      }
-
       const effectiveMessage = typeof userResponse === "string" && userResponse.length > 0 ? userResponse : message;
 
       if (typeof effectiveMessage !== 'string' || !effectiveMessage.trim()) {
-        return res.status(400).json({ type: 'error', message: 'Message is required.' });
+        const error = new Error('Message is required.');
+        error.statusCode = 400;
+        throw error;
       }
+
+      await emit('status', { stage: 'understanding', message: 'Understanding your request...' });
 
       activeConversation = conversationId
         ? await conversationService.getConversation({
@@ -128,10 +125,18 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         content: effectiveMessage,
       });
 
+      await emit('status', {
+        stage: 'planning',
+        message: normalizedToolkits.length > 0
+          ? 'Planning the best response and checking available tools...'
+          : 'Preparing a contextual response...',
+      });
+
       const result = await assistantOrchestrator.processPrompt({
         message: effectiveMessage,
         userId,
         entityId,
+        organizationId: req.organization.organization_id,
         selectedToolkits: normalizedToolkits,
         followupContext: followupContext || null,
         answers: answers || [],
@@ -139,7 +144,10 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
           role: item.role,
           text: item.content,
         })),
+        onProgress: event => emit('progress', event),
       });
+
+      await emit('status', { stage: 'responding', message: 'Preparing the response...' });
 
       await conversationService.addMessage({
         organizationId: req.organization.organization_id,
@@ -150,19 +158,78 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         metadata: assistantMessageMetadata(result),
       });
 
-      return res.json({ ...result, conversationId: activeConversation.id });
+      return { ...result, conversationId: activeConversation.id };
+    } catch (error) {
+      if (activeConversation) error.conversationId = activeConversation.id;
+      throw error;
+    }
+  }
+
+  async function handleAssistant(req, res) {
+    try {
+      return res.json(await runAssistant(req));
     } catch (error) {
       console.error("[Orchestration] Assistant error:", error);
-      const status = error.statusCode || 500;
-      return res.status(status).json({
+      return res.status(error.statusCode || 500).json({
         type: "error",
         message: error.message,
-        ...(activeConversation ? { conversationId: activeConversation.id } : {}),
+        ...(error.conversationId ? { conversationId: error.conversationId } : {}),
       });
     }
   }
 
+  async function handleAssistantStream(req, res) {
+    res.status(200);
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders?.();
+
+    let closed = false;
+    res.on('close', () => { closed = true; });
+
+    const sendEvent = async (event, data) => {
+      if (closed || res.writableEnded) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    try {
+      await sendEvent('status', { stage: 'connected', message: 'Connected to SwiftCollab...' });
+      const result = await runAssistant(req, sendEvent);
+      const message = assistantMessageText(result);
+
+      await sendEvent('response_start', {
+        type: result.type || 'chat',
+        conversationId: result.conversationId,
+      });
+
+      // Stream the finalized response in small chunks. Tool execution progress
+      // is emitted independently while the orchestrator is working.
+      const chunks = message.match(/[\s\S]{1,80}/g) || [''];
+      for (const delta of chunks) {
+        if (closed) break;
+        await sendEvent('message_delta', { delta });
+        await new Promise(resolve => setTimeout(resolve, 8));
+      }
+
+      await sendEvent('result', result);
+      await sendEvent('done', { conversationId: result.conversationId });
+    } catch (error) {
+      console.error('[Orchestration] Streaming assistant error:', error);
+      await sendEvent('error', {
+        message: error.message || 'Unable to process the request.',
+        ...(error.conversationId ? { conversationId: error.conversationId } : {}),
+      });
+    } finally {
+      if (!res.writableEnded) res.end();
+    }
+  }
+
   router.post("/assistant", authenticateToken, requireOrganization(), handleAssistant);
+  router.post("/assistant/stream", authenticateToken, requireOrganization(), handleAssistantStream);
   router.post("/unified", authenticateToken, requireOrganization(), handleAssistant);
 
   // ---------------------------------------------------------------------------
@@ -488,6 +555,20 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
       // Check connection status for each app
       for (const [appId, toolkit] of Object.entries(toolkitsByApp)) {
         try {
+          // A native connection takes precedence. Composio remains the
+          // fallback when the direct adapter is not connected.
+          if (connectorService) {
+            const direct = await connectorService.getDirectStatus({
+              appId,
+              organizationId: req.organization.organization_id,
+              userId,
+            });
+            if (direct.connected) {
+              connections[appId] = { ...direct, connected: true, provider: 'direct' };
+              continue;
+            }
+          }
+
           // Handle Frappe/ERPNext with our custom integration
           if (CUSTOM_INTEGRATION_APPS.includes(appId.toLowerCase())) {
             try {
@@ -542,6 +623,10 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
           console.warn(`[Connection] Failed to check ${appId}:`, err.message);
           connections[appId] = { connected: false, error: err.message };
         }
+      }
+
+      if (Object.values(connections).some(connection => connection?.connected)) {
+        composioService.clearEntityCache(entityId);
       }
 
       return res.json({ connections });
@@ -725,6 +810,9 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
       }
 
       const account = await composioService.getConnection(connectionId);
+      if (account?.status === 'ACTIVE') {
+        composioService.clearEntityCache(`user_${req.user.userId}`);
+      }
 
       return res.json({
         connectionId,

@@ -31,6 +31,10 @@ const { query, initializeDatabase } = require('./db');
 const redis = require('./services/redis');
 const { ComposioService } = require('./composioService');
 const { FrappeService } = require('./integrations/frappe');
+const { ComposioProvider } = require('./integrations/ComposioProvider');
+const { ConnectorService } = require('./integrations/ConnectorService');
+const { createDirectConnectors } = require('./integrations/directConnectors');
+const { createLLMService } = require('./services/llmService');
 
 // -----------------------------------------------------------------------------
 // Orchestration Components (The "Thinking" Layer)
@@ -60,6 +64,7 @@ const interviewSchedulingRoutes = require('./routes/interviewScheduling');
 const googleWorkspaceRoutes = require('./routes/googleWorkspace');
 const { startAutomaticInterviewSchedulingJob, stopAutomaticInterviewSchedulingJob } = require('./jobs/automaticInterviewSchedulingJob');
 const { initOrchestrationRoutes } = require('./routes/orchestration');
+const { initConnectorRoutes } = require('./routes/connectors');
 
 // -----------------------------------------------------------------------------
 // Middleware
@@ -81,23 +86,6 @@ const FRONTEND_URL = process.env.FRONTEND_URL || RENDER_APP_URL || 'http://local
 if (!process.env.APP_URL) process.env.APP_URL = FRONTEND_URL;
 const COMPOSIO_API_KEY = process.env.COMPOSIO_API_KEY;
 
-function normalizeBearerCredential(value, variableName) {
-  const rawValue = String(value || '');
-  const normalizedValue = rawValue
-    .trim()
-    .replace(/^Bearer\s+/i, '')
-    .replace(/\s+/g, '');
-
-  if (rawValue && rawValue !== normalizedValue) {
-    console.warn(`[Config] Removed invalid whitespace or a Bearer prefix from ${variableName}`);
-  }
-
-  return normalizedValue;
-}
-
-// Render secrets must contain only the key. Normalize accidental pasted
-// whitespace/prefixes so they cannot produce an invalid HTTP header value.
-const OPENAI_API_KEY = normalizeBearerCredential(process.env.OPENAI_API_KEY, 'OPENAI_API_KEY');
 const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || '127.0.0.1:7233';
 const TEMPORAL_ENABLED = process.env.TEMPORAL_ENABLED !== 'false';
 const ALLOWED_ORIGINS = new Set([
@@ -113,76 +101,11 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 // -----------------------------------------------------------------------------
-// OpenAI API helper (injected into ToolRouter, SlotFiller, and Engines).
-// The function name is retained below at injection sites for compatibility
-// with the existing orchestration component interfaces.
+// Provider-neutral LLM helper. Existing components retain the legacy
+// `callGemini` callback name, but can now use either OpenAI or local Ollama.
 // -----------------------------------------------------------------------------
-async function callOpenAI(systemPrompt, userPrompt, temperature = 0.1) {
-  if (!OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY not configured');
-  }
-
-  const maxAttempts = 3;
-  let lastError;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const response = await fetch(
-        'https://api.openai.com/v1/responses',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: 'gpt-4.1-mini',
-            instructions: systemPrompt,
-            input: userPrompt,
-          }),
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.output_text || '';
-      }
-
-      const error = await response.text();
-      lastError = new Error(`OpenAI API error: ${response.status} - ${error}`);
-      const isQuotaExhausted = response.status === 429 &&
-        /quota exceeded|insufficient_quota/i.test(error);
-      const isTransient = [500, 502, 503, 504].includes(response.status) ||
-        (response.status === 429 && !isQuotaExhausted);
-
-      if (!isTransient || attempt === maxAttempts) {
-        lastError.nonRetryable = !isTransient;
-        throw lastError;
-      }
-
-      const delayMs = 1000 * (2 ** (attempt - 1));
-      console.warn(`[OpenAI] Request failed with ${response.status}; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts})`);
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-    } catch (error) {
-      lastError = error;
-      if (error.nonRetryable || attempt === maxAttempts) {
-        throw error;
-      }
-
-      // Network errors are also normally temporary. HTTP errors that should
-      // not be retried are thrown above before reaching this branch.
-      const delayMs = 1000 * (2 ** (attempt - 1));
-      console.warn(`[OpenAI] Request error; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts}): ${error.message}`);
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-    }
-  }
-
-  throw lastError;
-}
-
-// Existing orchestration components still consume this callback under the
-// legacy `callGemini` name. It is intentionally OpenAI-only.
-const callGemini = callOpenAI;
+const llmService = createLLMService();
+const callGemini = llmService.complete;
 
 // -----------------------------------------------------------------------------
 // Initialize Express App
@@ -303,8 +226,10 @@ app.get('/api/health/detailed', authenticateToken, async (_req, res) => {
       composio: {
         configured: !!COMPOSIO_API_KEY,
       },
-      openai: {
-        configured: !!OPENAI_API_KEY,
+      llm: {
+        provider: llmService.provider,
+        model: llmService.model,
+        configured: llmService.configured,
       },
     },
   });
@@ -345,6 +270,10 @@ async function bootstrapOrchestration() {
     return null;
   }
   const composioService = new ComposioService(COMPOSIO_API_KEY);
+  const connectorService = new ConnectorService({
+    composioProvider: new ComposioProvider(composioService),
+    directConnectors: createDirectConnectors(),
+  });
   console.log('      Composio service ready');
 
   // Step 3: Initialize Frappe Service (optional)
@@ -363,10 +292,18 @@ async function bootstrapOrchestration() {
 
   // Step 4: Build Orchestration Components
   console.log('[4/6] Building orchestration stack...');
+  const llmStatus = await llmService.checkConnection();
+  console.log(`      LLM provider: ${llmService.provider} (${llmService.model})`);
+  if (llmService.provider === 'ollama' && !llmStatus.reachable) {
+    console.warn(`      Ollama is not reachable at ${llmService.baseUrl}`);
+  } else if (llmService.provider === 'ollama' && !llmStatus.modelInstalled) {
+    console.warn(`      Ollama model is not installed: ${llmService.model}`);
+  }
 
   // 4a. ToolRouter - Selects tools and extracts initial params
   const toolRouter = new ToolRouter({
     composioToolSet: composioService,
+    connectorService,
     callGemini,
     frappeService,
     query,
@@ -389,6 +326,7 @@ async function bootstrapOrchestration() {
   // 4c. ExecutorV2 - Unified execution (Temporal primary, fallback to direct)
   const executor = new ExecutorV2({
     composio: composioService,
+    connectorService,
     query,
     callGemini,
     options: {
@@ -465,7 +403,7 @@ async function bootstrapOrchestration() {
   console.log(' Orchestration Bootstrap Complete');
   console.log('========================================\n');
 
-  return { assistantOrchestrator, composioService };
+  return { assistantOrchestrator, composioService, connectorService };
 }
 
 /**
@@ -509,14 +447,17 @@ async function main() {
     const bootstrapResult = await bootstrapOrchestration();
     const assistantOrchestrator = bootstrapResult?.assistantOrchestrator;
     const composioService = bootstrapResult?.composioService;
+    const connectorService = bootstrapResult?.connectorService;
 
     if (assistantOrchestrator) {
+      app.use('/api/connectors', initConnectorRoutes({ connectorService, authenticateToken }));
       // Mount orchestration routes (requires orchestrator)
       const orchestrationRoutes = initOrchestrationRoutes(
         assistantOrchestrator,
         authenticateToken,
         optionalAuth,
-        composioService
+        composioService,
+        connectorService
       );
       app.use('/api', orchestrationRoutes);
     } else {

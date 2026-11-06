@@ -157,9 +157,10 @@ class Semaphore {
 // -----------------------------------------------------------------------------
 
 class ExecutorV2 {
-  constructor({ composio, query, callGemini, options = {} }) {
+  constructor({ composio, connectorService = null, query, callGemini, options = {} }) {
     if (!composio) throw new Error("composio required");
     this.composio = composio;
+    this.connectorService = connectorService;
     this.query = query || null;
     this.callGemini = callGemini || null;
 
@@ -379,6 +380,9 @@ class ExecutorV2 {
   // ---------------------------------------------------------------------------
 
   async _executeComposioAction(actionName, params, entityId) {
+    if (this.connectorService) {
+      return this.connectorService.executeAction({ actionName, params, entityId });
+    }
     // Prefer positional arguments (our ComposioService wrapper uses this signature).
     // Only fall back to the object signature if positional invocation fails.
     try {
@@ -423,7 +427,10 @@ class ExecutorV2 {
     // SYSTEM_* and FRAPPE_* steps are not handled by the Temporal Composio-only worker.
     // Execute them directly in-process.
     const steps = Array.isArray(plan.steps) ? plan.steps : [];
-    const requiresLocalExecution = steps.some((s) => this.isSystemAction(s?.action) || this.isFrappeAction(s?.action));
+    const requiresLocalExecution = steps.some((s) =>
+      this.isSystemAction(s?.action) || this.isFrappeAction(s?.action) ||
+      s?.provider === 'direct' || String(s?.action || '').startsWith('JIRA_')
+    );
     if (requiresLocalExecution) {
       return this._executeInternal({ plan, userId, entityId, conversationId, options, onProgress, resumeFrom });
     }
@@ -662,6 +669,7 @@ class ExecutorV2 {
       originalMessage: options.originalMessage || null,
       entityId,
       userId,
+      organizationId: options.organizationId || null,
     };
     return this.execute({ plan, userId, entityId, conversationId, options, onProgress, resumeFrom });
   }
@@ -1236,7 +1244,7 @@ class ExecutorV2 {
         return { ...base, success: true, status: "success", data, endTime: Date.now(), duration: Date.now() - startedAt };
       }
 
-      const toolResult = await this._executeToolStep(step, previousResults, entityId, userId);
+      const toolResult = await this._executeToolStep(step, previousResults, entityId, userId, plan);
       const ok = isToolSuccess(toolResult);
 
       const endTime = Date.now();
@@ -1272,7 +1280,7 @@ class ExecutorV2 {
     return !!actionName && String(actionName).startsWith("SYSTEM_");
   }
 
-  async _executeToolStep(step, previousResults, entityId, userId) {
+  async _executeToolStep(step, previousResults, entityId, userId, plan = {}) {
     const actionName = ActionRegistry.resolveAction(step.action);
     const phaseToUse = step.phase || this.currentPhase;
 
@@ -1350,7 +1358,11 @@ class ExecutorV2 {
     let rawResult;
     try {
       if (this.isSystemAction(actionName)) {
-        const data = await this._executeSystemAction(actionName, finalParams, { entityId });
+        const data = await this._executeSystemAction(actionName, finalParams, {
+          entityId,
+          userId,
+          organizationId: plan.organizationId,
+        });
         rawResult = { successful: true, data, error: null };
       } else if (this.isFrappeAction(actionName)) {
         // Use per-user FrappeClient if userId available, else fall back to legacy service
@@ -1376,8 +1388,24 @@ class ExecutorV2 {
           error: frappe.success ? null : frappe.error || frappe.message || "Frappe action failed",
         };
       } else {
-        // Fix 2: composio compatibility wrapper
-        const exec = await this._executeComposioAction(actionName, finalParams, entityId);
+        const exec = step.provider === 'direct' && this.connectorService
+          ? await this.connectorService.executeAction({
+            actionName,
+            params: finalParams,
+            entityId,
+            userId,
+            organizationId: plan.organizationId,
+            preferredProvider: 'direct',
+          })
+          : this.connectorService
+            ? await this.connectorService.executeAction({
+              actionName,
+              params: finalParams,
+              entityId,
+              userId,
+              organizationId: plan.organizationId,
+            })
+            : await this._executeComposioAction(actionName, finalParams, entityId);
         rawResult = { successful: !!exec.success, data: exec.data, error: exec.error };
       }
     } catch (err) {
@@ -1441,26 +1469,23 @@ class ExecutorV2 {
     return (mapping[tk] || [tk.toLowerCase()]).map((s) => String(s).toLowerCase());
   }
 
-  async _executeSystemAction(actionName, params, { entityId } = {}) {
+  async _executeSystemAction(actionName, params, { entityId, userId, organizationId } = {}) {
     if (actionName === "SYSTEM_CHECK_CONNECTIONS") {
-      return await this._systemCheckConnections(params, { entityId });
+      return await this._systemCheckConnections(params, { entityId, userId, organizationId });
     }
     throw new Error(`Unknown system action: ${actionName}`);
   }
 
-  async _systemCheckConnections(params, { entityId } = {}) {
+  async _systemCheckConnections(params, { entityId, userId: contextUserId, organizationId } = {}) {
     const requestedToolkitsRaw = Array.isArray(params?.toolkits) ? params.toolkits : [];
     const requestedToolkits = [...new Set(requestedToolkitsRaw.map((t) => String(t || "").trim()).filter(Boolean))].map((t) =>
       t.toUpperCase()
     );
 
-    const defaultToolkits = ["GOOGLECALENDAR", "GMAIL", "SLACK", "JIRA"];
-    const toolkitsToCheck = requestedToolkits.length > 0 ? requestedToolkits : defaultToolkits;
+    let toolkitsToCheck = [...requestedToolkits];
 
-    if (!toolkitsToCheck.includes("FRAPPE")) toolkitsToCheck.push("FRAPPE");
-
-    const userId = params?.userId ? String(params.userId) : null;
-    const verifyWithComposio = !!params?.verifyWithComposio;
+    const userId = params?.userId ? String(params.userId) : contextUserId ? String(contextUserId) : null;
+    const verifyWithComposio = params?.verifyWithComposio !== false;
     const includeAuthUrls = !!params?.includeAuthUrls;
 
     let dbAccounts = [];
@@ -1497,12 +1522,53 @@ class ExecutorV2 {
       }
     }
 
+    const nativeConnectedByToolkit = new Map();
+    if (this.connectorService && organizationId) {
+      const nativeCandidates = requestedToolkits.length > 0
+        ? requestedToolkits
+        : this.connectorService.listCatalog()
+          .filter(item => item.providers?.direct?.status === 'available')
+          .map(item => item.toolkit);
+      for (const toolkit of nativeCandidates) {
+        if (!this.connectorService.canExecuteDirect(toolkit) || toolkit === 'FRAPPE') continue;
+        try {
+          const native = await this.connectorService.getDirectStatus({
+            appId: toolkit,
+            organizationId,
+            userId,
+          });
+          if (native.connected) nativeConnectedByToolkit.set(toolkit, native);
+        } catch (error) {
+          console.warn(`[ExecutorV2] Unable to verify native ${toolkit}:`, error.message);
+        }
+      }
+    }
+
+    // "What is connected?" should discover the user's actual apps instead of
+    // checking a hard-coded list. Specific requested toolkits remain supported.
+    if (toolkitsToCheck.length === 0) {
+      toolkitsToCheck = [...new Set([...composioConnectedByToolkit, ...nativeConnectedByToolkit.keys()])];
+    }
+
+    let frappeConnected = !!this.frappeService?.isConfigured?.();
+    if (!frappeConnected && isValidUUID(userId)) {
+      try {
+        const { frappeConnectionManager } = require('../integrations/frappe');
+        frappeConnected = await frappeConnectionManager.hasActiveConnection(userId);
+      } catch (error) {
+        console.warn('[ExecutorV2] Unable to verify Frappe connection:', error.message);
+      }
+    }
+    if (frappeConnected && !toolkitsToCheck.includes('FRAPPE')) {
+      toolkitsToCheck.push('FRAPPE');
+    }
+
     const connections = {};
     const missing = [];
 
     for (const toolkit of toolkitsToCheck) {
       if (toolkit === "FRAPPE") {
-        const configured = !!this.frappeService?.isConfigured?.();
+        const configured = frappeConnected;
         connections.FRAPPE = {
           connected: configured,
           configured,
@@ -1518,10 +1584,11 @@ class ExecutorV2 {
 
       const dbConnected = !!(dbRow && String(dbRow.status || "").toLowerCase() === "active" && dbRow.composio_connection_id);
       const composioConnected = verifyWithComposio ? composioConnectedByToolkit.has(toolkit) : null;
+      const nativeConnection = nativeConnectedByToolkit.get(toolkit) || null;
 
       const connected = verifyWithComposio
-        ? !!(dbConnected || composioConnected)
-        : dbConnected;
+        ? !!(dbConnected || composioConnected || nativeConnection)
+        : !!(dbConnected || nativeConnection);
 
       const info = {
         connected,
@@ -1529,8 +1596,10 @@ class ExecutorV2 {
         sources: {
           db: dbConnected,
           composio: verifyWithComposio ? composioConnected : null,
+          native: !!nativeConnection,
         },
       };
+      if (nativeConnection) info.native = this._sanitizeSecrets(nativeConnection);
 
       if (dbRow) {
         info.db = {

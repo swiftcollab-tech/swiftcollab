@@ -196,7 +196,9 @@ function App({ initialWorkspace, onWorkspaceChange }) {
   const [appChoices, setAppChoices] = useState([]); // currently unused, but UI kept
   const [checkedTasks, setCheckedTasks] = useState({}); // { taskId: boolean } for brain recommendations
   const [isLoading, setIsLoading] = useState(false); // Loading state for async operations
+  const [agentStatus, setAgentStatus] = useState('');
   const [connectionStatus, setConnectionStatus] = useState({}); // { appId: { connected: boolean, authUrl?: string } }
+  const [connectorCatalog, setConnectorCatalog] = useState({});
 
   // ---- OAuth Config Modal State ----
   const [oauthConfigModal, setOauthConfigModal] = useState({
@@ -230,13 +232,22 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     error: null
   });
 
-  // ---- Connect method chooser (Composio sign-in vs API key) ----
+  // ---- Connect method chooser (native SwiftCollab connector vs Composio) ----
   const [connectMethodModal, setConnectMethodModal] = useState({
     visible: false,
     app: null,
+    connector: null,
     authUrl: null,
     loading: false,
     error: null
+  });
+  const [resourceSelectionModal, setResourceSelectionModal] = useState({
+    visible: false,
+    app: null,
+    resources: [],
+    resourceId: '',
+    loading: false,
+    error: null,
   });
 
   // ---- ERPNext Connect Modal State (for Frappe/ERPNext with URL + API Key + Secret) ----
@@ -525,22 +536,91 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     }
   };
 
-  const CUSTOM_CONNECT_APPS = ['frappe', 'erpnext'];
-
   // ---- Handle app Connect button click ----
-  const onAppConnect = (app, authUrl) => {
-    if (CUSTOM_CONNECT_APPS.includes(app.id?.toLowerCase())) {
-      showApiKeyModal(app.id.toUpperCase(), app.name);
-      return;
+  const onAppConnect = async (app, authUrl) => {
+    let connector = connectorCatalog[app.id] || null;
+    if (!connector) {
+      try {
+        const data = await apiClient.get('/api/connectors/catalog');
+        const nextCatalog = Object.fromEntries((data.connectors || []).map(item => [item.id, item]));
+        setConnectorCatalog(nextCatalog);
+        connector = nextCatalog[app.id] || null;
+      } catch (error) {
+        console.error('[Connector] Unable to load connector catalogue:', error);
+      }
     }
 
     setConnectMethodModal({
       visible: true,
       app,
+      connector,
       authUrl: authUrl || null,
       loading: false,
       error: null
     });
+  };
+
+  const startDirectConnect = async (app) => {
+    if (app.id === 'frappe') {
+      setConnectMethodModal({ visible: false, app: null, connector: null, authUrl: null, loading: false, error: null });
+      showApiKeyModal('FRAPPE', app.name);
+      return;
+    }
+
+    const data = await apiClient.post(`/api/connectors/${app.id}/connect`, {
+      provider: 'direct',
+      redirectUrl: `${API_URL}/api/connectors/${app.id}/callback`,
+    });
+    if (!data.redirectUrl) throw new Error('The direct connector did not return an authorization URL.');
+
+    const popup = window.open(data.redirectUrl, '_blank', 'width=600,height=700');
+    const pollInterval = setInterval(async () => {
+      try {
+        const status = await apiClient.get(`/api/connectors/${app.id}/direct-status`);
+        if (status.requiresResourceSelection && status.resources?.length) {
+          clearInterval(pollInterval);
+          if (popup && !popup.closed) popup.close();
+          setResourceSelectionModal({
+            visible: true,
+            app,
+            resources: status.resources,
+            resourceId: status.resources[0]?.id || '',
+            loading: false,
+            error: null,
+          });
+          return;
+        }
+        if (status.connected) {
+          clearInterval(pollInterval);
+          if (popup && !popup.closed) popup.close();
+          setConnectionStatus(prev => ({ ...prev, [app.id]: { ...status, connected: true, provider: 'direct' } }));
+          setMessages(prev => [...prev, {
+            role: 'assistant',
+            text: `Successfully connected ${app.name} through the native SwiftCollab connector.`
+          }]);
+        }
+      } catch (_error) {
+        // The user may still be completing provider consent.
+      }
+    }, 3000);
+    setTimeout(() => clearInterval(pollInterval), 120000);
+  };
+
+  const completeResourceSelection = async () => {
+    const { app, resourceId } = resourceSelectionModal;
+    if (!app || !resourceId) return;
+    setResourceSelectionModal(prev => ({ ...prev, loading: true, error: null }));
+    try {
+      const status = await apiClient.post(`/api/connectors/${app.id}/select-resource`, { resourceId });
+      setConnectionStatus(prev => ({ ...prev, [app.id]: { ...status, connected: true, provider: 'direct' } }));
+      setResourceSelectionModal({ visible: false, app: null, resources: [], resourceId: '', loading: false, error: null });
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        text: `Successfully connected ${app.name} site ${status.siteName || ''} through SwiftCollab.`.trim()
+      }]);
+    } catch (error) {
+      setResourceSelectionModal(prev => ({ ...prev, loading: false, error: error.message }));
+    }
   };
 
   const watchComposioPopup = (app, popup) => {
@@ -918,13 +998,65 @@ function App({ initialWorkspace, onWorkspaceChange }) {
       ...payload,
     };
 
+    const streamMessageId = `stream_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    let streamMessageVisible = false;
+    let streamedText = '';
+
+    const updateStreamingMessage = delta => {
+      streamedText += delta;
+      if (!streamMessageVisible) {
+        streamMessageVisible = true;
+        setMessages(prev => [...prev, {
+          id: streamMessageId,
+          role: 'assistant',
+          text: streamedText,
+          streaming: true,
+        }]);
+        return;
+      }
+      setMessages(prev => prev.map(message => (
+        message.id === streamMessageId
+          ? { ...message, text: streamedText }
+          : message
+      )));
+    };
+
+    setIsLoading(true);
+    setAgentStatus('Connecting to SwiftCollab...');
     try {
-      return await assistantApi.sendMessage(baseBody);
+      return await assistantApi.streamMessage(baseBody, {
+        onEvent: (event, data) => {
+          if (event === 'status') {
+            setAgentStatus(data.message || 'Working on your request...');
+          } else if (event === 'progress') {
+            const progressLabel = data.message
+              || data.label
+              || (data.type ? data.type.replaceAll('_', ' ') : 'Executing the requested action...');
+            setAgentStatus(progressLabel);
+          } else if (event === 'response_start') {
+            setAgentStatus('Writing the response...');
+          } else if (event === 'message_delta' && data.delta) {
+            updateStreamingMessage(data.delta);
+          }
+        },
+      });
     } catch (err) {
+      // Older local backends may not have the streaming route yet. Preserve a
+      // narrow compatibility fallback without hiding genuine assistant errors.
+      if (err instanceof ApiError && err.status === 404) {
+        setAgentStatus('Using standard response mode...');
+        return assistantApi.sendMessage(baseBody);
+      }
       if (err instanceof ApiError) {
         throw err;
       }
       throw new ApiError(err.message || 'Request failed', 0);
+    } finally {
+      if (streamMessageVisible) {
+        setMessages(prev => prev.filter(message => message.id !== streamMessageId));
+      }
+      setAgentStatus('');
+      setIsLoading(false);
     }
   };
 
@@ -1030,18 +1162,6 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     console.log('[App] pendingFields exists:', followupContext?.pendingFields);
     console.log('[App] pendingFields length:', followupContext?.pendingFields?.length);
     console.log('[App] ========================================');
-
-    // No apps have been dragged in at all
-    if (selectedAppIds.length === 0) {
-      setMessages(prev => [
-        ...prev,
-        {
-          role: 'assistant',
-          text: 'Drag at least one app into AI OS or Work OS before running commands.',
-        },
-      ]);
-      return;
-    }
 
     // CRITICAL: Check for natural language followup response FIRST
     // This handles when user types a response like "kan" or "project = KAN" after being asked for JQL
@@ -1553,9 +1673,77 @@ function App({ initialWorkspace, onWorkspaceChange }) {
               transition={{ duration: 0.8 }}
               className="flex-1 w-full overflow-y-auto"
             >
-              <div className="min-h-full flex flex-col items-center justify-center py-8">
-                <div className="w-full max-w-2xl">
-                  <div className="flex items-center justify-between mb-8">
+              <div className="min-h-full flex items-stretch justify-center px-4 py-6 lg:px-8">
+                <div className="grid h-[calc(100vh-9.5rem)] w-full max-w-7xl grid-cols-1 gap-4 md:grid-cols-[260px_minmax(0,1fr)]">
+                  <aside className="hidden min-h-0 flex-col rounded-2xl border border-white/10 bg-black/60 p-3 backdrop-blur-xl md:flex">
+                    <div className="flex items-center justify-between border-b border-white/10 px-2 pb-3">
+                      <div>
+                        <div className="text-sm font-semibold text-white">Conversations</div>
+                        <div className="text-xs text-white/45">Your private chat history</div>
+                      </div>
+                      <button
+                        onClick={handleNewConversation}
+                        className="rounded-lg bg-white/10 p-2 text-white hover:bg-white/20"
+                        title="New conversation"
+                        aria-label="New conversation"
+                      >
+                        <MessageSquarePlus className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    <div className="mt-3 min-h-0 flex-1 space-y-1 overflow-y-auto">
+                      {conversations.length === 0 ? (
+                        <p className="px-2 py-4 text-xs text-white/45">No conversations yet.</p>
+                      ) : conversations.map(item => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => item.id !== activeConversationId && previewConversation(item.id)}
+                          className={`w-full rounded-xl px-3 py-2 text-left transition-colors ${item.id === activeConversationId
+                            ? 'bg-white/15 text-white'
+                            : historyPreviewId === item.id
+                              ? 'bg-blue-500/15 text-blue-100'
+                              : 'text-white/65 hover:bg-white/10 hover:text-white'
+                            }`}
+                        >
+                          <div className="truncate text-xs font-medium">{item.title}</div>
+                          <div className="mt-1 text-[10px] text-white/35">
+                            {item.id === activeConversationId ? 'Current chat' : 'Preview conversation'}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    {historyPreviewId && (
+                      <div className="mt-3 border-t border-white/10 pt-3">
+                        <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-white/40">
+                          History preview
+                        </div>
+                        <div className="max-h-40 space-y-2 overflow-y-auto rounded-xl bg-white/5 p-2">
+                          {historyPreviewLoading ? (
+                            <p className="text-xs text-white/45">Loading...</p>
+                          ) : historyPreviewMessages.slice(-4).map((message, index) => (
+                            <div key={message.id || index} className="text-xs text-white/60">
+                              <span className="font-semibold text-white/80">
+                                {message.role === 'user' ? 'You: ' : 'SwiftCollab: '}
+                              </span>
+                              <span className="line-clamp-2">{message.text}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={continuePreviewedConversation}
+                          className="mt-2 w-full rounded-lg bg-blue-500/20 px-3 py-2 text-xs font-medium text-blue-200 hover:bg-blue-500/30"
+                        >
+                          Continue this conversation
+                        </button>
+                      </div>
+                    )}
+                  </aside>
+
+                  <section className="flex min-h-0 min-w-0 flex-col">
+                  <div className="mb-4 flex items-center justify-between">
                     <h2
                       className="text-2xl font-bold text-white/70"
                       style={{ fontFamily: '"Outfit", sans-serif' }}
@@ -1571,8 +1759,22 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     </button>
                   </div>
 
+                  <select
+                    value={activeConversationId || ''}
+                    onChange={(event) => event.target.value ? loadConversation(event.target.value) : handleNewConversation()}
+                    className="mb-3 w-full rounded-xl border border-white/10 bg-black/60 px-3 py-2 text-xs text-white md:hidden"
+                    aria-label="Current conversation"
+                  >
+                    <option value="">New conversation</option>
+                    {conversations.map(item => (
+                      <option key={item.id} value={item.id} className="bg-gray-900">
+                        {item.title}
+                      </option>
+                    ))}
+                  </select>
+
                   {/* Command bar (AI-powered) */}
-                  <div className="relative group">
+                  <div className="hidden">
                     <div className="absolute -inset-1 bg-white/30 rounded-2xl blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200"></div>
                     <div className="relative flex items-center bg-black/80 backdrop-blur-xl border border-white/10 rounded-2xl p-4 gap-3">
                       <Search className="w-6 h-6 text-gray-400" />
@@ -1643,7 +1845,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                   )}
 
                   {/* Current chat */}
-                  <div className="mt-6 border border-white/10 rounded-2xl bg-black/70 backdrop-blur-xl p-4 max-h-72 overflow-y-auto">
+                  <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-2xl border border-white/10 bg-black/70 p-4 backdrop-blur-xl">
                     <div className="sticky top-0 z-10 mb-3 flex items-center gap-2 bg-black/90 pb-3 border-b border-white/10">
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-semibold text-white">Current chat</div>
@@ -2000,11 +2202,54 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                         </div>
                       ))
                     )}
+                    {isLoading && (
+                      <div className="mb-3 flex justify-start" role="status" aria-live="polite">
+                        <div className="rounded-2xl bg-white/10 px-3 py-2 text-xs text-white/65">
+                          <span className="animate-pulse">{agentStatus || 'SwiftCollab is thinking...'}</span>
+                        </div>
+                      </div>
+                    )}
                     <div ref={messagesEndRef} />
                   </div>
 
+                  {/* Chat composer stays at the bottom of the active conversation. */}
+                  <div className="relative mt-3 shrink-0 rounded-2xl border border-white/15 bg-black/85 p-3 shadow-2xl backdrop-blur-xl">
+                    <div className="flex items-end gap-3">
+                      <Search className="mb-2 h-5 w-5 shrink-0 text-white/40" />
+                      <textarea
+                        rows={1}
+                        placeholder="Message SwiftCollab..."
+                        className="max-h-32 min-h-10 flex-1 resize-none bg-transparent px-1 py-2 text-sm text-white outline-none placeholder:text-white/35"
+                        value={command}
+                        onChange={(event) => setCommand(event.target.value)}
+                        onKeyDown={handleCommandKeyDown}
+                        autoFocus
+                      />
+                      <button
+                        type="button"
+                        onClick={handleDailyPlanner}
+                        disabled={isLoading}
+                        className="mb-1 rounded-lg bg-blue-500/15 px-3 py-2 text-xs font-medium text-blue-200 hover:bg-blue-500/25 disabled:opacity-40"
+                        title="Generate your personalized daily plan"
+                      >
+                        Daily plan
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRunCommand(false)}
+                        disabled={isLoading || !command.trim()}
+                        className="mb-1 rounded-lg bg-white px-4 py-2 text-xs font-semibold text-black hover:bg-white/85 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {isLoading ? 'Working...' : 'Send'}
+                      </button>
+                    </div>
+                    <div className="mt-1 pl-8 text-[10px] text-white/30">
+                      Enter to send · Shift + Enter for a new line
+                    </div>
+                  </div>
+
                   {/* Read-only history preview kept separate from the current chat. */}
-                  <div className="mt-4 border border-white/10 rounded-2xl bg-black/50 backdrop-blur-xl p-4">
+                  <div className="hidden">
                     <div className="mb-3">
                       <div className="text-sm font-semibold text-white">Chat history</div>
                       <div className="text-xs text-white/50">
@@ -2061,7 +2306,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     ) : null}
                   </div>
 
-                  <div className="mt-12 flex justify-center gap-4 flex-wrap">
+                  <div className="hidden">
                     {[...aiOsApps, ...workOsApps].slice(0, 5).map((app, i) => (
                       <motion.div
                         key={app.id}
@@ -2090,6 +2335,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                       </div>
                     )}
                   </div>
+                  </section>
                 </div>
               </div>
             </motion.div>
@@ -2388,7 +2634,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
           )}
         </AnimatePresence>
 
-        {/* Connect method chooser: Composio sign-in vs API key */}
+        {/* Connect method chooser: native SwiftCollab connector vs Composio */}
         <AnimatePresence>
           {connectMethodModal.visible && connectMethodModal.app && (
             <motion.div
@@ -2396,7 +2642,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
-              onClick={() => setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null })}
+              onClick={() => setConnectMethodModal({ visible: false, app: null, connector: null, authUrl: null, loading: false, error: null })}
             >
               <motion.div
                 initial={{ scale: 0.9, opacity: 0 }}
@@ -2409,17 +2655,46 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                   Connect {connectMethodModal.app.name}
                 </h2>
                 <p className="text-gray-400 text-sm mb-5">
-                  Choose how you want to sign in. Composio opens the app&apos;s own login (Google, Slack, and so on). API key is only for apps that give you a key in settings.
+                  Choose the connection provider. Native connectors are operated by SwiftCollab; Composio remains available as a fallback.
                 </p>
 
                 <div className="space-y-3">
+                  <button
+                    onClick={async () => {
+                      const { app } = connectMethodModal;
+                      setConnectMethodModal(prev => ({ ...prev, loading: true, error: null }));
+                      try {
+                        await startDirectConnect(app);
+                        if (app.id !== 'frappe') {
+                          setConnectMethodModal({ visible: false, app: null, connector: null, authUrl: null, loading: false, error: null });
+                        }
+                      } catch (err) {
+                        setConnectMethodModal(prev => ({ ...prev, loading: false, error: err.message || 'Failed to start direct connection' }));
+                      }
+                    }}
+                    disabled={connectMethodModal.loading || connectMethodModal.connector?.providers?.direct?.status !== 'available'}
+                    className="w-full text-left p-4 rounded-xl border border-emerald-500/40 bg-emerald-900/20 hover:bg-emerald-900/40 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <div className="flex items-start gap-3">
+                      <Link2 className="w-5 h-5 text-emerald-400 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="text-white font-medium">Connect directly with SwiftCollab</div>
+                        <div className="text-gray-400 text-sm mt-1">
+                          {connectMethodModal.connector?.providers?.direct?.status === 'available'
+                            ? `Authorize ${connectMethodModal.app.name} using SwiftCollab's native connector.`
+                            : 'Native connector scaffolded; provider OAuth and API setup is still required.'}
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+
                   <button
                     onClick={async () => {
                       const { app, authUrl } = connectMethodModal;
                       setConnectMethodModal(prev => ({ ...prev, loading: true, error: null }));
                       try {
                         await startComposioConnect(app, authUrl);
-                        setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null });
+                        setConnectMethodModal({ visible: false, app: null, connector: null, authUrl: null, loading: false, error: null });
                       } catch (err) {
                         setConnectMethodModal(prev => ({
                           ...prev,
@@ -2444,25 +2719,6 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     </div>
                   </button>
 
-                  <button
-                    onClick={() => {
-                      const app = connectMethodModal.app;
-                      setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null });
-                      showApiKeyModal(app.id.toUpperCase(), app.name);
-                    }}
-                    disabled={connectMethodModal.loading}
-                    className="w-full text-left p-4 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-60"
-                  >
-                    <div className="flex items-start gap-3">
-                      <Key className="w-5 h-5 text-amber-400 mt-0.5 shrink-0" />
-                      <div>
-                        <div className="text-white font-medium">Use API key</div>
-                        <div className="text-gray-400 text-sm mt-1">
-                          Paste a key from {connectMethodModal.app.name} settings if you are not using Composio login.
-                        </div>
-                      </div>
-                    </div>
-                  </button>
                 </div>
 
                 {connectMethodModal.error && (
@@ -2472,10 +2728,59 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                 )}
 
                 <button
-                  onClick={() => setConnectMethodModal({ visible: false, app: null, authUrl: null, loading: false, error: null })}
+                  onClick={() => setConnectMethodModal({ visible: false, app: null, connector: null, authUrl: null, loading: false, error: null })}
                   className="mt-5 w-full py-2 px-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
                 >
                   Cancel
+                </button>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Native connectors such as Jira may grant access to multiple sites. */}
+        <AnimatePresence>
+          {resourceSelectionModal.visible && resourceSelectionModal.app && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-gray-800 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl border border-gray-700"
+              >
+                <h2 className="text-xl font-semibold text-white mb-2">
+                  Select {resourceSelectionModal.app.name} site
+                </h2>
+                <p className="text-gray-400 text-sm mb-4">
+                  Choose the customer organization/site that SwiftCollab should use.
+                </p>
+                <select
+                  value={resourceSelectionModal.resourceId}
+                  onChange={event => setResourceSelectionModal(prev => ({ ...prev, resourceId: event.target.value }))}
+                  className="w-full bg-gray-900 border border-gray-600 rounded-lg px-3 py-2 text-white"
+                >
+                  {resourceSelectionModal.resources.map(resource => (
+                    <option key={resource.id} value={resource.id}>
+                      {resource.name}{resource.url ? ` — ${resource.url}` : ''}
+                    </option>
+                  ))}
+                </select>
+                {resourceSelectionModal.error && (
+                  <div className="mt-3 p-2 bg-red-900/30 border border-red-500/30 rounded text-red-300 text-sm">
+                    {resourceSelectionModal.error}
+                  </div>
+                )}
+                <button
+                  onClick={completeResourceSelection}
+                  disabled={resourceSelectionModal.loading || !resourceSelectionModal.resourceId}
+                  className="mt-5 w-full py-2 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg text-sm"
+                >
+                  {resourceSelectionModal.loading ? 'Connecting…' : 'Use this site'}
                 </button>
               </motion.div>
             </motion.div>

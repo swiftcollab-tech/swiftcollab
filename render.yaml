@@ -50,6 +50,12 @@ services:
         sync: false
       - key: COMPOSIO_API_KEY
         sync: false
+      - key: JIRA_CLIENT_ID
+        sync: false
+      - key: JIRA_CLIENT_SECRET
+        sync: false
+      - key: JIRA_REDIRECT_URI
+        value: https://swiftcollab-dev.onrender.com/api/connectors/jira/callback
 
 databases:
   - name: swiftcollab-dev-db

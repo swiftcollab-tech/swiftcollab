@@ -113,6 +113,81 @@ class ApiService {
     }
   }
 
+  async stream(endpoint, data, { onEvent, signal, _isRetry = false } = {}) {
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      method: 'POST',
+      headers: this.getHeaders({ Accept: 'text/event-stream' }),
+      credentials: 'include',
+      body: JSON.stringify(data),
+      signal,
+    });
+
+    if (response.status === 401 && !_isRetry) {
+      const refreshed = await this.tryRefreshToken();
+      if (refreshed) {
+        return this.stream(endpoint, data, { onEvent, signal, _isRetry: true });
+      }
+      if (this.onUnauthorized) this.onUnauthorized();
+      throw new ApiError('Session expired. Please log in again.', 401);
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      let parsed;
+      try { parsed = JSON.parse(errorBody); } catch { parsed = null; }
+      throw new ApiError(parsed?.message || parsed?.error || errorBody || `Request failed with status ${response.status}`, response.status, parsed);
+    }
+
+    if (!response.body) {
+      throw new ApiError('Streaming is not supported by this browser.', 0);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult = null;
+
+    const dispatchBlock = block => {
+      if (!block.trim()) return;
+      let event = 'message';
+      const dataLines = [];
+      block.split('\n').forEach(line => {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+      });
+      if (dataLines.length === 0) return;
+
+      let payload;
+      const rawData = dataLines.join('\n');
+      try { payload = JSON.parse(rawData); } catch { payload = { message: rawData }; }
+
+      onEvent?.(event, payload);
+      if (event === 'result') finalResult = payload;
+      if (event === 'error') {
+        throw new ApiError(payload.message || 'Streaming request failed.', payload.status || 500, payload);
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, '\n');
+
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        dispatchBlock(block);
+        boundary = buffer.indexOf('\n\n');
+      }
+
+      if (done) break;
+    }
+
+    if (buffer.trim()) dispatchBlock(buffer);
+    if (!finalResult) throw new ApiError('The assistant stream ended before returning a result.', 0);
+    return finalResult;
+  }
+
   async tryRefreshToken() {
     // Prevent multiple simultaneous refresh attempts
     if (this.refreshPromise) {
@@ -211,6 +286,7 @@ export const workspaceApi = {
 // AI Assistant APIs
 export const assistantApi = {
   sendMessage: (data) => api.post('/api/assistant', data),
+  streamMessage: (data, options) => api.stream('/api/assistant/stream', data, options),
   executeBrainTask: (data) => api.post('/api/unified', data),
 };
 

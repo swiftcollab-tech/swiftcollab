@@ -5,6 +5,7 @@ const {
   interpretConfirmationResponseSimple,
   filterToolsByIntent
 } = require("./core/ConfirmationInterpreter");
+const { classifyToolIntent } = require('./core/ToolIntentGate');
 
 /**
  * AssistantOrchestrator (Redis-backed, drop-in)
@@ -129,7 +130,7 @@ class AssistantOrchestrator {
           };
         }
 
-        const onProgress = this._makeProgressPublisher(sess);
+        const onProgress = this._makeProgressPublisher(sess, enrichedContext.onProgress);
         const result = await this.executor.execute({
           plan: resumeToken.plan,
           entityId: enrichedContext.entityId,
@@ -170,6 +171,30 @@ class AssistantOrchestrator {
       }
 
       // 3) Fresh message → route
+      const intent = classifyToolIntent(
+        userText,
+        enabledToolkits,
+        enrichedContext.conversationHistory || []
+      );
+      if (!intent.requiresTools) {
+        const reply = intent.immediateReply || await this.composer.composeChat({
+          message: userText,
+          conversationHistory: enrichedContext.conversationHistory || [],
+        });
+
+        sess.mode = "IDLE";
+        sess.lastAction = "CHAT_FAST_PATH";
+        await this._endSlotSessionIfAny(sess);
+        await this._saveSession(sessKey, sess);
+
+        return {
+          type: "chat",
+          sessionId,
+          reply,
+          debug: { route: 'fast_chat', reason: intent.reason },
+        };
+      }
+
       const routing = await this.toolRouter.route(userText, enabledToolkits, enrichedContext);
 
       // Inject safe defaults for SYSTEM_* tools (so they can use app/toolkit context)
@@ -294,10 +319,12 @@ class AssistantOrchestrator {
     message,
     userId,
     entityId,
+    organizationId = null,
     selectedToolkits = [],
     followupContext = null,
     answers = [],
     conversationHistory = [],
+    onProgress = null,
   }) {
     const sessionId = `sess_${entityId}_${Date.now()}`;
 
@@ -318,8 +345,10 @@ class AssistantOrchestrator {
         context: {
           userId,
           entityId,
+          organizationId,
           conversationHistory,
           userTimeZone: followupContext?.userTimeZone || "America/New_York",
+          onProgress,
         },
         resumeToken: followupContext?.resumeToken || null,
       });
@@ -707,7 +736,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
 
   async _executeToolChainNow(sess, tools, context) {
     try {
-      const onProgress = this._makeProgressPublisher(sess);
+      const onProgress = this._makeProgressPublisher(sess, context.onProgress);
 
       const execResult = await this.executor.executeToolChain({
         tools,
@@ -718,6 +747,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
           // execution_plans.id is a PostgreSQL UUID column.
           planId: crypto.randomUUID(),
           userTimeZone: context.userTimeZone,
+          organizationId: context.organizationId,
         },
         onProgress,
       });
@@ -927,11 +957,18 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
   // -------------------------
   // Internal: Progress publishing (Redis PubSub)
   // -------------------------
-  _makeProgressPublisher(sess) {
+  _makeProgressPublisher(sess, directPublisher = null) {
     const channel = sess.progressChannel || this._defaultProgressChannel(sess.sessionId);
 
     // executor will call onProgress(stepEvent)
     return async (evt) => {
+      if (typeof directPublisher === 'function') {
+        try {
+          await directPublisher(evt);
+        } catch (_) {
+          // Streaming progress is best-effort and must never stop execution.
+        }
+      }
       try {
         const payload = JSON.stringify({
           sessionId: sess.sessionId,
@@ -981,6 +1018,11 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
 
       if (!tool.params.userId && context?.userId) tool.params.userId = context.userId;
       if (!tool.params.entityId && context?.entityId) tool.params.entityId = context.entityId;
+      if (actionName === "SYSTEM_CHECK_CONNECTIONS") {
+        // Connection status must use Composio's live per-user state. The local
+        // connected_accounts table can lag behind a newly completed OAuth flow.
+        tool.params.verifyWithComposio = true;
+      }
     }
   }
 }
