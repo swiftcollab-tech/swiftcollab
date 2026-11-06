@@ -72,6 +72,25 @@ test('native Jira connection participates in connected-tool routing', async () =
   assert.deepEqual(connected, ['JIRA']);
 });
 
+test('an explicit Jira assignment routes directly to the update action', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'Asia/Calcutta';
+  router.callGemini = async () => { throw new Error('LLM should not be needed'); };
+
+  const result = await router._stageA_selectTools({
+    message: 'Assign Jira issue SCRUM-1 to me',
+    availableTools: [
+      { name: 'JIRA_GET_ISSUE', description: 'Get a Jira issue', toolkit: 'JIRA' },
+      { name: 'JIRA_UPDATE_ISSUE', description: 'Update a Jira issue', toolkit: 'JIRA' },
+    ],
+    context: {},
+  });
+
+  assert.deepEqual(result.selectedTools, [
+    { name: 'JIRA_UPDATE_ISSUE', sequence: 1, usePreviousOutput: false },
+  ]);
+});
+
 test('reminder requests route to the connected calendar app', async () => {
   const router = Object.create(ToolRouter.prototype);
   router.MAX_RELEVANT_TOOLKITS = 10;

@@ -2374,6 +2374,16 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
       .filter(tool => !tool.name.includes('JQL') && !tool.name.includes('_JQL_'))
       .map(tool => ({ name: tool.name, description: tool.description, toolkit: tool.toolkit }));
 
+    const hasJiraUpdate = shortlist.some(tool => tool.name === 'JIRA_UPDATE_ISSUE');
+    const hasIssueKey = /\b[A-Z][A-Z0-9_]*-\d+\b/i.test(String(message || ''));
+    const isAssignment = /\bassign(?:ed|ment)?\b/i.test(String(message || ''));
+    if (hasJiraUpdate && hasIssueKey && isAssignment) {
+      return {
+        selectedTools: [{ name: 'JIRA_UPDATE_ISSUE', sequence: 1, usePreviousOutput: false }],
+        chatResponse: null,
+      };
+    }
+
     const systemPrompt = `You route SwiftCollab work requests to connected-app tools.
 
 Time: ${now.nowRfc3339} (${this.USER_TIMEZONE})

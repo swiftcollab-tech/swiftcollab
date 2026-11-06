@@ -1409,6 +1409,7 @@ class ExecutorV2 {
         rawResult = { successful: !!exec.success, data: exec.data, error: exec.error };
       }
     } catch (err) {
+      console.error(`[ExecutorV2] ${actionName} failed:`, err.message);
       rawResult = { successful: false, data: null, error: err.message };
     }
 

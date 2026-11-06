@@ -50,8 +50,8 @@ const EXECUTION_PHASES = {
 // Now includes side effect classification
 // ============================================
 const ACTION_ALLOWLIST = {
-  version: '2.5.0',
-  last_updated: '2025-12-15',
+  version: '2.6.0',
+  last_updated: '2026-11-07',
   actions: {
     // ========== SYSTEM (INTERNAL) ==========
     SYSTEM_CHECK_CONNECTIONS: {
@@ -354,6 +354,22 @@ const ACTION_ALLOWLIST = {
           fields: ['key', 'summary', 'status'],
         },
       },
+    },
+    JIRA_GET_ISSUE: {
+      enabled: true,
+      provider: 'composio',
+      composio_action: 'JIRA_GET_ISSUE',
+      category: 'project_management',
+      mutating: false,
+      irreversible: false,
+      description: 'Get one Jira ticket by issue ID or key',
+      required_scopes: ['read:jira-work'],
+      user_facing_name: 'Get Jira ticket',
+      examples: ['show SCRUM-1', 'get Jira issue', 'open ticket details'],
+      side_effect_tier: SIDE_EFFECT_TIERS.PURE_READ,
+      side_effects: [],
+      preflight_safe: true,
+      preflight_alternative: null,
     },
     JIRA_UPDATE_ISSUE: {
       enabled: true,

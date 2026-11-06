@@ -5,7 +5,7 @@ const { encrypt, decrypt } = require('./credentialEncryptionService');
 const AUTH_URL = 'https://auth.atlassian.com/authorize';
 const TOKEN_URL = 'https://auth.atlassian.com/oauth/token';
 const RESOURCES_URL = 'https://api.atlassian.com/oauth/token/accessible-resources';
-const SCOPES = ['read:jira-work', 'write:jira-work', 'offline_access'];
+const SCOPES = ['read:jira-work', 'read:jira-user', 'write:jira-work', 'offline_access'];
 const ACTION_ALIASES = {
   JIRA_CREATE_JIRA_ISSUE: 'JIRA_CREATE_ISSUE',
   JIRA_GET_JIRA_ISSUE_DETAILS: 'JIRA_GET_ISSUE',
@@ -475,6 +475,30 @@ async function jiraRequest({ organizationId, siteSelector = null, path, method =
 
 const value = (params, ...keys) => keys.map(key => params?.[key]).find(item => item !== undefined && item !== null && item !== '');
 
+const issueKeyFrom = params => value(
+  params,
+  'issue_key',
+  'issueKey',
+  'issue_id_or_key',
+  'issueIdOrKey',
+  'issue_id',
+  'issueId',
+  'key'
+);
+
+function isCurrentUserAssignee(assignee) {
+  const normalized = String(assignee || '').trim().toLowerCase().replace(/\s+/g, '');
+  return ['me', 'myself', 'currentuser', 'currentuser()', 'current_user'].includes(normalized);
+}
+
+async function resolveAssignee(organizationId, siteSelector, assignee, fetchImpl) {
+  if (assignee && typeof assignee === 'object' && assignee.accountId) return assignee.accountId;
+  if (!isCurrentUserAssignee(assignee)) return assignee;
+  const currentUser = await jiraRequest({ organizationId, siteSelector, path: 'myself', fetchImpl });
+  if (!currentUser?.accountId) throw new Error('Jira did not return an account ID for the connected user');
+  return currentUser.accountId;
+}
+
 async function transitionIssue(organizationId, siteSelector, issueKey, transition, fetchImpl) {
   const available = await jiraRequest({ organizationId, siteSelector, path: `issue/${encodeURIComponent(issueKey)}/transitions`, fetchImpl });
   const wanted = String(transition || '').toLowerCase();
@@ -517,7 +541,9 @@ async function executeAction({ organizationId, actionName, params = {}, fetchImp
     if (params.priority) fields.priority = { name: params.priority };
     if (params.labels) fields.labels = params.labels;
     if (params.parent_key) fields.parent = { key: params.parent_key };
-    if (params.assignee) fields.assignee = { accountId: params.assignee };
+    if (params.assignee) {
+      fields.assignee = { accountId: await resolveAssignee(organizationId, siteSelector, params.assignee, fetchImpl) };
+    }
     return jiraRequest({ organizationId, siteSelector, path: 'issue', method: 'POST', body: { fields }, fetchImpl });
   }
 
@@ -539,20 +565,30 @@ async function executeAction({ organizationId, actionName, params = {}, fetchImp
   }
 
   if (action === 'JIRA_GET_ISSUE') {
-    const issueKey = value(params, 'issue_key', 'issueKey', 'key');
+    const issueKey = issueKeyFrom(params);
     if (!issueKey) throw new Error('Jira get issue requires issue_key');
     return jiraRequest({ organizationId, siteSelector, path: `issue/${encodeURIComponent(issueKey)}`, queryParams: { fields: params.fields }, fetchImpl });
   }
 
   if (action === 'JIRA_UPDATE_ISSUE') {
-    const issueKey = value(params, 'issue_key', 'issueKey', 'key');
+    const issueKey = issueKeyFrom(params);
     if (!issueKey) throw new Error('Jira update issue requires issue_key');
     const fields = {};
     if (params.summary !== undefined) fields.summary = params.summary;
     if (params.description !== undefined) fields.description = adf(params.description);
     if (params.priority !== undefined) fields.priority = { name: params.priority };
     if (params.labels !== undefined) fields.labels = params.labels;
-    if (params.assignee !== undefined) fields.assignee = { accountId: params.assignee };
+    if (params.assignee !== undefined) {
+      const accountId = await resolveAssignee(organizationId, siteSelector, params.assignee, fetchImpl);
+      await jiraRequest({
+        organizationId,
+        siteSelector,
+        path: `issue/${encodeURIComponent(issueKey)}/assignee`,
+        method: 'PUT',
+        body: { accountId },
+        fetchImpl,
+      });
+    }
     if (Object.keys(fields).length) {
       await jiraRequest({ organizationId, siteSelector, path: `issue/${encodeURIComponent(issueKey)}`, method: 'PUT', body: { fields }, fetchImpl });
     }
@@ -562,14 +598,14 @@ async function executeAction({ organizationId, actionName, params = {}, fetchImp
   }
 
   if (action === 'JIRA_ADD_COMMENT') {
-    const issueKey = value(params, 'issue_key', 'issueKey', 'key');
+    const issueKey = issueKeyFrom(params);
     const comment = value(params, 'comment', 'body');
     if (!issueKey || !comment) throw new Error('Jira add comment requires issue_key and comment');
     return jiraRequest({ organizationId, siteSelector, path: `issue/${encodeURIComponent(issueKey)}/comment`, method: 'POST', body: { body: adf(comment) }, fetchImpl });
   }
 
   if (action === 'JIRA_TRANSITION_ISSUE') {
-    const issueKey = value(params, 'issue_key', 'issueKey', 'key');
+    const issueKey = issueKeyFrom(params);
     const transition = value(params, 'transition', 'transitionId', 'status');
     if (!issueKey || !transition) throw new Error('Jira transition requires issue_key and transition');
     await transitionIssue(organizationId, siteSelector, issueKey, transition, fetchImpl);
@@ -686,4 +722,6 @@ module.exports = {
   supportsAction,
   getTools,
   adf,
+  issueKeyFrom,
+  isCurrentUserAssignee,
 };

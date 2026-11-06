@@ -2,7 +2,15 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { CONNECTOR_CATALOG, getConnector, connectorForAction } = require('../integrations/connectorCatalog');
 const { ConnectorService } = require('../integrations/ConnectorService');
-const { adf, supportsAction, getTools } = require('../services/jiraConnectorService');
+const {
+  SCOPES,
+  adf,
+  supportsAction,
+  getTools,
+  issueKeyFrom,
+  isCurrentUserAssignee,
+} = require('../services/jiraConnectorService');
+const { ActionRegistry } = require('../orchestration/core/ActionRegistry');
 
 test('catalog covers every application currently displayed in SwiftCollab', () => {
   assert.equal(CONNECTOR_CATALOG.length, 33);
@@ -93,6 +101,16 @@ test('Jira connector recognizes canonical and Composio action aliases', () => {
     version: 1,
     content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Hello Jira' }] }],
   });
+});
+
+test('Jira issue identifiers and current-user assignment are provider compatible', () => {
+  assert.equal(issueKeyFrom({ issue_key: 'SCRUM-1' }), 'SCRUM-1');
+  assert.equal(issueKeyFrom({ issue_id_or_key: 'SCRUM-2' }), 'SCRUM-2');
+  assert.equal(isCurrentUserAssignee('me'), true);
+  assert.equal(isCurrentUserAssignee('currentUser()'), true);
+  assert.equal(isCurrentUserAssignee('account-id-1'), false);
+  assert.ok(SCOPES.includes('read:jira-user'));
+  assert.equal(ActionRegistry.isValidAction('JIRA_GET_ISSUE'), true);
 });
 
 test('native Jira tools accept an optional site selector for multi-site organizations', () => {

@@ -15,7 +15,8 @@ const ACTION_PARAMS = {
     'fields', 'expand', 'project_key',
   ],
   'JIRA_GET_ISSUE': [
-    'issue_key', 'issueKey', 'key', 'fields', 'expand',
+    'issue_key', 'issueKey', 'issue_id_or_key', 'issueIdOrKey',
+    'issue_id', 'issueId', 'key', 'fields', 'expand',
   ],
   'JIRA_GET_ISSUES': [
     'issue_keys', 'issueKeys', 'keys', 'fields', 'jql',
@@ -26,7 +27,8 @@ const ACTION_PARAMS = {
     'labels', 'components', 'customFields', 'parent_key',
   ],
   'JIRA_UPDATE_ISSUE': [
-    'issue_key', 'issueKey', 'summary', 'description',
+    'issue_key', 'issueKey', 'issue_id_or_key', 'issueIdOrKey',
+    'issue_id', 'issueId', 'summary', 'description',
     'status', 'priority', 'assignee', 'labels', 'transition',
   ],
   'JIRA_ADD_COMMENT': [
