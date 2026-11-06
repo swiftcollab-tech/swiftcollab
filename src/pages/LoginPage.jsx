@@ -344,9 +344,9 @@ export default function LoginPage({ onSuccess }) {
         {/* Footer */}
         <p className="mt-6 text-center text-gray-500 text-sm">
           By continuing, you agree to our{' '}
-          <a href="#" className="text-blue-400 hover:underline">Terms of Service</a>
+          <a href="/terms" className="text-blue-400 hover:underline">Terms of Service</a>
           {' '}and{' '}
-          <a href="#" className="text-blue-400 hover:underline">Privacy Policy</a>
+          <a href="/privacy" className="text-blue-400 hover:underline">Privacy Policy</a>
         </p>
       </motion.div>
     </div>

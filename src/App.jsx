@@ -9,6 +9,7 @@ import OrganizationTeamPanel from './components/OrganizationTeamPanel';
 import { Search, LogOut, User, Plus, Settings, Key, Link2, MessageSquarePlus, Trash2 } from 'lucide-react';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginPage from './pages/LoginPage';
+import LegalPage from './pages/LegalPage';
 import { API_URL, assistantApi, conversationApi, api as apiClient, ApiError } from './services/api';
 
 // Simple markdown renderer for chat messages
@@ -3002,6 +3003,16 @@ function AppWithAuth() {
 
 // Main export with AuthProvider
 export default function AppRoot() {
+  const path = window.location.pathname.replace(/\/+$/, '') || '/';
+
+  if (path === '/privacy') {
+    return <LegalPage type="privacy" />;
+  }
+
+  if (path === '/terms') {
+    return <LegalPage type="terms" />;
+  }
+
   return (
     <AuthProvider>
       <AppWithAuth />
