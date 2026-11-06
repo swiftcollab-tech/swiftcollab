@@ -36,19 +36,22 @@ const jiraConnector = {
   canExecuteActions: true,
   async initiateConnection({ organizationId, userId }) {
     const result = await jira.startConnection({ organizationId, userId });
-    return { redirectUrl: result.authorizationUrl, status: 'PENDING' };
+    return { redirectUrl: result.authorizationUrl, connectionAttemptId: result.connectionAttemptId, status: 'PENDING' };
   },
   async completeConnection({ state, code }) {
     return jira.completeConnection({ state, code });
   },
-  async getConnectionStatus({ organizationId }) {
-    return jira.status(organizationId);
+  async getConnectionStatus({ organizationId, connectionAttemptId }) {
+    return jira.status(organizationId, connectionAttemptId);
   },
-  async selectResource({ organizationId, resourceId }) {
-    return jira.selectResource({ organizationId, resourceId });
+  async selectResource({ organizationId, resourceId, connectionId }) {
+    return jira.selectResource({ organizationId, resourceId, connectionId });
   },
-  async disconnect({ organizationId }) {
-    return jira.disconnect(organizationId);
+  async setActiveResource({ organizationId, connectionId }) {
+    return jira.setPrimaryConnection({ organizationId, connectionId });
+  },
+  async disconnect({ organizationId, connectionId }) {
+    return jira.disconnect(organizationId, connectionId);
   },
   supportsAction(actionName) {
     return jira.supportsAction(actionName);

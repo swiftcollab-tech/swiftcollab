@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, CheckCircle, AlertCircle, Link } from 'lucide-react';
 
-const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConnect }) => {
+const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConnect, canManageConnections = false }) => {
     const [isOver, setIsOver] = useState(false);
 
     const handleDragOver = (e) => {
@@ -62,6 +62,7 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                 const isConnected = status?.connected === true;
                                 const isChecking = status === undefined;
                                 const requiresCustomModal = status?.requiresCustomModal; // Custom integration (like Frappe)
+                                const canManageConnection = canManageConnections && isConnected && app.id === 'jira' && status?.provider === 'direct';
 
                                 return (
                                     <motion.div
@@ -105,6 +106,17 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                             >
                                                 <Link className="w-3 h-3" />
                                                 {requiresCustomModal ? 'Configure' : 'Connect'}
+                                            </button>
+                                        )}
+
+                                        {canManageConnection && (
+                                            <button
+                                                onClick={(e) => handleConnect(e, app)}
+                                                className="absolute bottom-1 left-1 right-1 py-1 px-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg flex items-center justify-center gap-1 transition-colors shadow-lg z-20"
+                                                title="Manage connected Jira sites"
+                                            >
+                                                <Link className="w-3 h-3" />
+                                                Manage sites
                                             </button>
                                         )}
 

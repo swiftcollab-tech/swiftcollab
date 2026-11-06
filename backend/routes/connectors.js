@@ -56,6 +56,7 @@ function initConnectorRoutes({ connectorService, authenticateToken }) {
         appId: req.params.appId,
         organizationId: req.organization.organization_id,
         userId: req.user.userId,
+        connectionAttemptId: req.query.attemptId || null,
       }));
     } catch (error) {
       res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
@@ -69,7 +70,35 @@ function initConnectorRoutes({ connectorService, authenticateToken }) {
         organizationId: req.organization.organization_id,
         userId: req.user.userId,
         resourceId: req.body?.resourceId,
+        connectionId: req.body?.connectionId,
       }));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
+    }
+  });
+
+  router.put('/:appId/active-resource', authenticateToken, requireOrganization(['owner', 'admin']), async (req, res) => {
+    try {
+      res.json(await connectorService.setActiveResource({
+        appId: req.params.appId,
+        organizationId: req.organization.organization_id,
+        userId: req.user.userId,
+        connectionId: req.body?.connectionId,
+      }));
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
+    }
+  });
+
+  router.delete('/:appId/connect/:connectionId', authenticateToken, requireOrganization(['owner', 'admin']), async (req, res) => {
+    try {
+      await connectorService.disconnect({
+        appId: req.params.appId,
+        organizationId: req.organization.organization_id,
+        userId: req.user.userId,
+        connectionId: req.params.connectionId,
+      });
+      res.status(204).end();
     } catch (error) {
       res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
     }

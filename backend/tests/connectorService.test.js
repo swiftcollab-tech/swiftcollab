@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { CONNECTOR_CATALOG, getConnector, connectorForAction } = require('../integrations/connectorCatalog');
 const { ConnectorService } = require('../integrations/ConnectorService');
-const { adf, supportsAction } = require('../services/jiraConnectorService');
+const { adf, supportsAction, getTools } = require('../services/jiraConnectorService');
 
 test('catalog covers every application currently displayed in SwiftCollab', () => {
   assert.equal(CONNECTOR_CATALOG.length, 33);
@@ -93,4 +93,45 @@ test('Jira connector recognizes canonical and Composio action aliases', () => {
     version: 1,
     content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Hello Jira' }] }],
   });
+});
+
+test('native Jira tools accept an optional site selector for multi-site organizations', () => {
+  const tools = getTools();
+  assert.ok(tools.length > 0);
+  for (const tool of tools) {
+    assert.ok(tool.parameters.properties.jira_site, `${tool.name} should accept jira_site`);
+    assert.equal(tool.parameters.required?.includes('jira_site'), false);
+  }
+});
+
+test('connector service forwards Jira connection attempt and resource identifiers', async () => {
+  const calls = [];
+  const service = new ConnectorService({
+    directConnectors: {
+      jira: {
+        getConnectionStatus: async input => { calls.push(['status', input]); return { connected: true }; },
+        selectResource: async input => { calls.push(['select', input]); return { connected: true }; },
+        setActiveResource: async input => { calls.push(['active', input]); return { connected: true }; },
+        disconnect: async input => { calls.push(['disconnect', input]); },
+      },
+    },
+  });
+
+  await service.getDirectStatus({
+    appId: 'jira', organizationId: 'org_1', userId: 'user_1', connectionAttemptId: 'attempt_1',
+  });
+  await service.selectResource({
+    appId: 'jira', organizationId: 'org_1', userId: 'user_1', resourceId: 'site_1', connectionId: 'pending_1',
+  });
+  await service.setActiveResource({
+    appId: 'jira', organizationId: 'org_1', userId: 'user_1', connectionId: 'connection_2',
+  });
+  await service.disconnect({
+    appId: 'jira', organizationId: 'org_1', userId: 'user_1', connectionId: 'connection_1',
+  });
+
+  assert.equal(calls[0][1].connectionAttemptId, 'attempt_1');
+  assert.equal(calls[1][1].connectionId, 'pending_1');
+  assert.equal(calls[2][1].connectionId, 'connection_2');
+  assert.equal(calls[3][1].connectionId, 'connection_1');
 });

@@ -81,13 +81,13 @@ class ConnectorService {
     return adapter.initiateConnection({ app, organizationId, userId, redirectUrl, connectionParams });
   }
 
-  async getDirectStatus({ appId, organizationId, userId }) {
+  async getDirectStatus({ appId, organizationId, userId, connectionAttemptId = null }) {
     const app = this._app(appId);
     const adapter = this._directAdapter(app);
     if (!adapter?.getConnectionStatus) {
       return { connected: false, status: app.providers.direct.status };
     }
-    return adapter.getConnectionStatus({ app, organizationId, userId });
+    return adapter.getConnectionStatus({ app, organizationId, userId, connectionAttemptId });
   }
 
   async completeConnection({ appId, state, code }) {
@@ -97,18 +97,25 @@ class ConnectorService {
     return adapter.completeConnection({ app, state, code });
   }
 
-  async selectResource({ appId, organizationId, userId, resourceId }) {
+  async selectResource({ appId, organizationId, userId, resourceId, connectionId }) {
     const app = this._app(appId);
     const adapter = this._directAdapter(app);
     if (!adapter?.selectResource) throw new ConnectorNotReadyError(app);
-    return adapter.selectResource({ app, organizationId, userId, resourceId });
+    return adapter.selectResource({ app, organizationId, userId, resourceId, connectionId });
   }
 
-  async disconnect({ appId, organizationId, userId }) {
+  async setActiveResource({ appId, organizationId, userId, connectionId }) {
+    const app = this._app(appId);
+    const adapter = this._directAdapter(app);
+    if (!adapter?.setActiveResource) throw new ConnectorNotReadyError(app);
+    return adapter.setActiveResource({ app, organizationId, userId, connectionId });
+  }
+
+  async disconnect({ appId, organizationId, userId, connectionId = null }) {
     const app = this._app(appId);
     const adapter = this._directAdapter(app);
     if (!adapter?.disconnect) throw new ConnectorNotReadyError(app);
-    return adapter.disconnect({ app, organizationId, userId });
+    return adapter.disconnect({ app, organizationId, userId, connectionId });
   }
 
   async executeAction({ actionName, params, entityId, organizationId, userId, preferredProvider = null }) {

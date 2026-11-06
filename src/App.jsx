@@ -247,6 +247,15 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     app: null,
     resources: [],
     resourceId: '',
+    connectionId: null,
+    loading: false,
+    error: null,
+  });
+  const [jiraConnectionsModal, setJiraConnectionsModal] = useState({
+    visible: false,
+    app: null,
+    connections: [],
+    activeConnectionId: null,
     loading: false,
     error: null,
   });
@@ -539,6 +548,30 @@ function App({ initialWorkspace, onWorkspaceChange }) {
 
   // ---- Handle app Connect button click ----
   const onAppConnect = async (app, authUrl) => {
+    if (app.id === 'jira' && connectionStatus[app.id]?.provider === 'direct') {
+      setJiraConnectionsModal({
+        visible: true,
+        app,
+        connections: connectionStatus[app.id]?.connections || [],
+        activeConnectionId: connectionStatus[app.id]?.activeConnectionId || null,
+        loading: true,
+        error: null,
+      });
+      try {
+        const status = await apiClient.get('/api/connectors/jira/direct-status');
+        setConnectionStatus(prev => ({ ...prev, jira: { ...status, provider: 'direct' } }));
+        setJiraConnectionsModal(prev => ({
+          ...prev,
+          connections: status.connections || [],
+          activeConnectionId: status.activeConnectionId || null,
+          loading: false,
+        }));
+      } catch (error) {
+        setJiraConnectionsModal(prev => ({ ...prev, loading: false, error: error.message }));
+      }
+      return;
+    }
+
     let connector = connectorCatalog[app.id] || null;
     if (!connector) {
       try {
@@ -575,9 +608,10 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     if (!data.redirectUrl) throw new Error('The direct connector did not return an authorization URL.');
 
     const popup = window.open(data.redirectUrl, '_blank', 'width=600,height=700');
+    const attemptQuery = data.connectionAttemptId ? `?attemptId=${encodeURIComponent(data.connectionAttemptId)}` : '';
     const pollInterval = setInterval(async () => {
       try {
-        const status = await apiClient.get(`/api/connectors/${app.id}/direct-status`);
+        const status = await apiClient.get(`/api/connectors/${app.id}/direct-status${attemptQuery}`);
         if (status.requiresResourceSelection && status.resources?.length) {
           clearInterval(pollInterval);
           if (popup && !popup.closed) popup.close();
@@ -586,12 +620,13 @@ function App({ initialWorkspace, onWorkspaceChange }) {
             app,
             resources: status.resources,
             resourceId: status.resources[0]?.id || '',
+            connectionId: status.pendingConnectionId || null,
             loading: false,
             error: null,
           });
           return;
         }
-        if (status.connected) {
+        if (status.attemptComplete || (!data.connectionAttemptId && status.connected)) {
           clearInterval(pollInterval);
           if (popup && !popup.closed) popup.close();
           setConnectionStatus(prev => ({ ...prev, [app.id]: { ...status, connected: true, provider: 'direct' } }));
@@ -608,19 +643,56 @@ function App({ initialWorkspace, onWorkspaceChange }) {
   };
 
   const completeResourceSelection = async () => {
-    const { app, resourceId } = resourceSelectionModal;
+    const { app, resourceId, connectionId } = resourceSelectionModal;
     if (!app || !resourceId) return;
     setResourceSelectionModal(prev => ({ ...prev, loading: true, error: null }));
     try {
-      const status = await apiClient.post(`/api/connectors/${app.id}/select-resource`, { resourceId });
+      await apiClient.post(`/api/connectors/${app.id}/select-resource`, { resourceId, connectionId });
+      const status = await apiClient.get(`/api/connectors/${app.id}/direct-status`);
       setConnectionStatus(prev => ({ ...prev, [app.id]: { ...status, connected: true, provider: 'direct' } }));
-      setResourceSelectionModal({ visible: false, app: null, resources: [], resourceId: '', loading: false, error: null });
+      setResourceSelectionModal({ visible: false, app: null, resources: [], resourceId: '', connectionId: null, loading: false, error: null });
       setMessages(prev => [...prev, {
         role: 'assistant',
         text: `Successfully connected ${app.name} site ${status.siteName || ''} through SwiftCollab.`.trim()
       }]);
     } catch (error) {
       setResourceSelectionModal(prev => ({ ...prev, loading: false, error: error.message }));
+    }
+  };
+
+  const refreshJiraConnections = async () => {
+    const status = await apiClient.get('/api/connectors/jira/direct-status');
+    setConnectionStatus(prev => ({ ...prev, jira: { ...status, provider: 'direct' } }));
+    setJiraConnectionsModal(prev => ({
+      ...prev,
+      connections: status.connections || [],
+      activeConnectionId: status.activeConnectionId || null,
+      loading: false,
+      error: null,
+    }));
+    return status;
+  };
+
+  const setPrimaryJiraConnection = async (connectionId) => {
+    setJiraConnectionsModal(prev => ({ ...prev, loading: true, error: null }));
+    try {
+      await apiClient.put('/api/connectors/jira/active-resource', { connectionId });
+      await refreshJiraConnections();
+    } catch (error) {
+      setJiraConnectionsModal(prev => ({ ...prev, loading: false, error: error.message }));
+    }
+  };
+
+  const disconnectJiraConnection = async (connectionId) => {
+    setJiraConnectionsModal(prev => ({ ...prev, loading: true, error: null }));
+    try {
+      await apiClient.delete(`/api/connectors/jira/connect/${encodeURIComponent(connectionId)}`);
+      const status = await refreshJiraConnections();
+      if (!status.connected) {
+        setJiraConnectionsModal(prev => ({ ...prev, visible: false }));
+      }
+    } catch (error) {
+      setJiraConnectionsModal(prev => ({ ...prev, loading: false, error: error.message }));
     }
   };
 
@@ -1607,6 +1679,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     onRemove={handleRemoveFromAiOs}
                     connectionStatus={connectionStatus}
                     onConnect={onAppConnect}
+                    canManageConnections={['owner', 'admin'].includes(activeOrganization?.role)}
                     color="white"
                   />
                   <DropZone
@@ -1620,6 +1693,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     onRemove={handleRemoveFromWorkOs}
                     connectionStatus={connectionStatus}
                     onConnect={onAppConnect}
+                    canManageConnections={['owner', 'admin'].includes(activeOrganization?.role)}
                     color="white"
                   />
                 </div>
@@ -2733,6 +2807,108 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                   className="mt-5 w-full py-2 px-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors"
                 >
                   Cancel
+                </button>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Manage multiple native Jira site connections for this organization. */}
+        <AnimatePresence>
+          {jiraConnectionsModal.visible && jiraConnectionsModal.app && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+              onClick={() => setJiraConnectionsModal(prev => ({ ...prev, visible: false }))}
+            >
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.9, opacity: 0 }}
+                className="bg-gray-800 rounded-xl p-6 w-full max-w-xl mx-4 shadow-2xl border border-gray-700"
+                onClick={event => event.stopPropagation()}
+              >
+                <h2 className="text-xl font-semibold text-white mb-2">Jira sites</h2>
+                <p className="text-gray-400 text-sm mb-5">
+                  Connect multiple customer Jira sites. The primary site is used when a chat request does not name a site.
+                </p>
+
+                <div className="space-y-3 max-h-72 overflow-y-auto">
+                  {jiraConnectionsModal.connections.map(connection => (
+                    <div
+                      key={connection.connectionId}
+                      className={`flex items-start gap-3 rounded-lg border p-3 ${
+                        connection.connectionId === jiraConnectionsModal.activeConnectionId
+                          ? 'border-emerald-500/60 bg-emerald-900/20'
+                          : 'border-gray-700 bg-gray-900/40'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="primary-jira-site"
+                        className="mt-1"
+                        checked={connection.connectionId === jiraConnectionsModal.activeConnectionId}
+                        disabled={jiraConnectionsModal.loading}
+                        onChange={() => setPrimaryJiraConnection(connection.connectionId)}
+                        aria-label={`Use ${connection.siteName} as the primary Jira site`}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium text-white">{connection.siteName || 'Jira site'}</div>
+                        <div className="truncate text-xs text-gray-400">{connection.siteUrl || connection.siteId}</div>
+                        {connection.connectionId === jiraConnectionsModal.activeConnectionId && (
+                          <div className="mt-1 text-xs text-emerald-300">Primary site</div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={jiraConnectionsModal.loading}
+                        onClick={() => {
+                          if (window.confirm(`Disconnect ${connection.siteName || 'this Jira site'} from SwiftCollab?`)) {
+                            disconnectJiraConnection(connection.connectionId);
+                          }
+                        }}
+                        className="rounded-md p-2 text-gray-400 hover:bg-red-900/30 hover:text-red-300 disabled:opacity-50"
+                        title="Disconnect this Jira site"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {jiraConnectionsModal.error && (
+                  <div className="mt-4 p-2 bg-red-900/30 border border-red-500/30 rounded text-red-300 text-sm">
+                    {jiraConnectionsModal.error}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  disabled={jiraConnectionsModal.loading}
+                  onClick={async () => {
+                    const app = jiraConnectionsModal.app;
+                    setJiraConnectionsModal(prev => ({ ...prev, loading: true, error: null }));
+                    try {
+                      await startDirectConnect(app);
+                      setJiraConnectionsModal(prev => ({ ...prev, visible: false, loading: false }));
+                    } catch (error) {
+                      setJiraConnectionsModal(prev => ({ ...prev, loading: false, error: error.message }));
+                    }
+                  }}
+                  className="mt-5 w-full py-2 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg text-sm flex items-center justify-center gap-2"
+                >
+                  <Plus className="h-4 w-4" />
+                  Connect another Jira site
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setJiraConnectionsModal(prev => ({ ...prev, visible: false }))}
+                  className="mt-3 w-full py-2 px-4 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm"
+                >
+                  Close
                 </button>
               </motion.div>
             </motion.div>
