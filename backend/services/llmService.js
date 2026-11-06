@@ -116,18 +116,31 @@ function createLLMService(config = {}) {
     messages.push({ role: 'user', content: String(userPrompt || systemPrompt || '') });
     if (!userPrompt && systemPrompt) messages.splice(0, 1);
 
+    const requestBody = {
+      model: compatibleModel,
+      messages,
+      temperature,
+      stream: false,
+    };
+
+    // Routing, slot filling and action planning use temperature 0 and expect a
+    // JSON object. Declaring that requirement lets providers such as
+    // OpenRouter select a compatible model and prevents model-specific tool
+    // call tokens from leaking into the response text.
+    if (temperature === 0) {
+      requestBody.response_format = { type: 'json_object' };
+      if (/openrouter\.ai/i.test(compatibleBaseUrl)) {
+        requestBody.provider = { require_parameters: true };
+      }
+    }
+
     const response = await fetch(`${compatibleBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${compatibleApiKey}`,
       },
-      body: JSON.stringify({
-        model: compatibleModel,
-        messages,
-        temperature,
-        stream: false,
-      }),
+      body: JSON.stringify(requestBody),
       signal: createTimeoutSignal(timeoutMs),
     });
 

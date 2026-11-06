@@ -3370,6 +3370,13 @@ OUTPUT JSON ONLY:
     if (!raw) return null;
     let s = String(raw).trim();
 
+    // Some open-weight models expose their internal tool-call delimiters even
+    // when the prompt requests JSON. They are not part of the JSON payload.
+    s = s
+      .replace(/<\|(?:tool_call|tool_calls|assistant|analysis|final|end)[^|]*\|>/gi, "")
+      .replace(/<\/?(?:tool_call|tool_calls)>/gi, "")
+      .trim();
+
     const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced) s = fenced[1].trim();
 

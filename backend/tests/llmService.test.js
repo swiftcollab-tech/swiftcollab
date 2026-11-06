@@ -79,6 +79,8 @@ test('supports future OpenAI-compatible hosted model APIs', async (t) => {
       { role: 'system', content: 'Route the request.' },
       { role: 'user', content: 'Create a task.' },
     ]);
+    assert.deepEqual(request.response_format, { type: 'json_object' });
+    assert.equal(request.provider, undefined);
     return {
       ok: true,
       json: async () => ({ choices: [{ message: { content: 'Hosted response' } }] }),
@@ -94,5 +96,32 @@ test('supports future OpenAI-compatible hosted model APIs', async (t) => {
   assert.equal(
     await service.complete('Route the request.', 'Create a task.', 0),
     'Hosted response'
+  );
+});
+
+test('requires JSON-capable OpenRouter endpoints for deterministic orchestration calls', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    assert.deepEqual(request.response_format, { type: 'json_object' });
+    assert.deepEqual(request.provider, { require_parameters: true });
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '{"selectedTools":[]}' } }] }),
+    };
+  };
+
+  const service = createLLMService({
+    provider: 'openai-compatible',
+    compatibleBaseUrl: 'https://openrouter.ai/api/v1',
+    compatibleApiKey: 'openrouter-key',
+    compatibleModel: 'openrouter/free',
+  });
+
+  assert.equal(
+    await service.complete('Return JSON.', 'Create a Jira story.', 0),
+    '{"selectedTools":[]}'
   );
 });
