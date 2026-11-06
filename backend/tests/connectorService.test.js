@@ -7,6 +7,7 @@ const {
   adf,
   supportsAction,
   getTools,
+  normalizeIssueKey,
   issueKeyFrom,
   isCurrentUserAssignee,
 } = require('../services/jiraConnectorService');
@@ -105,6 +106,7 @@ test('Jira connector recognizes canonical and Composio action aliases', () => {
 
 test('Jira issue identifiers and current-user assignment are provider compatible', () => {
   assert.equal(issueKeyFrom({ issue_key: 'SCRUM-1' }), 'SCRUM-1');
+  assert.equal(normalizeIssueKey('SCRUM -1'), 'SCRUM-1');
   assert.equal(issueKeyFrom({ issue_id_or_key: 'SCRUM-2' }), 'SCRUM-2');
   assert.equal(isCurrentUserAssignee('me'), true);
   assert.equal(isCurrentUserAssignee('currentUser()'), true);

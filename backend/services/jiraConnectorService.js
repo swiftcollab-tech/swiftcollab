@@ -475,7 +475,13 @@ async function jiraRequest({ organizationId, siteSelector = null, path, method =
 
 const value = (params, ...keys) => keys.map(key => params?.[key]).find(item => item !== undefined && item !== null && item !== '');
 
-const issueKeyFrom = params => value(
+function normalizeIssueKey(issueKey) {
+  const raw = String(issueKey || '').trim();
+  const match = raw.match(/^([A-Z][A-Z0-9_]*)\s*-\s*(\d+)$/i);
+  return match ? `${match[1].toUpperCase()}-${match[2]}` : raw;
+}
+
+const issueKeyFrom = params => normalizeIssueKey(value(
   params,
   'issue_key',
   'issueKey',
@@ -484,7 +490,7 @@ const issueKeyFrom = params => value(
   'issue_id',
   'issueId',
   'key'
-);
+));
 
 function isCurrentUserAssignee(assignee, requestingUserId = null) {
   const normalized = String(assignee || '').trim().toLowerCase().replace(/\s+/g, '');
@@ -723,6 +729,7 @@ module.exports = {
   supportsAction,
   getTools,
   adf,
+  normalizeIssueKey,
   issueKeyFrom,
   isCurrentUserAssignee,
 };

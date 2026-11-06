@@ -137,6 +137,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         userId,
         entityId,
         organizationId: req.organization.organization_id,
+        conversationId: activeConversation.id,
         selectedToolkits: normalizedToolkits,
         followupContext: followupContext || null,
         answers: answers || [],

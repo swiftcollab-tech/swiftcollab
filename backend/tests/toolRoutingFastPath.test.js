@@ -126,6 +126,64 @@ test('Jira assignment preserves "me" instead of an internal SwiftCollab user ID'
   assert.equal(result.tools[0].params.assignee, 'me');
 });
 
+test('a Jira update resolves "above task" from recent conversation history', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'Asia/Calcutta';
+  router.callGemini = async () => JSON.stringify({
+    tools: [{
+      name: 'JIRA_UPDATE_ISSUE',
+      sequence: 1,
+      params: { description: 'We are integrating Jira to SwiftCollab through Atlassian.' },
+    }],
+  });
+
+  const selectedSchemas = new Map([['JIRA_UPDATE_ISSUE', {
+    name: 'JIRA_UPDATE_ISSUE',
+    toolkit: 'JIRA',
+    parameters: {
+      type: 'object',
+      properties: { issue_key: { type: 'string' }, description: { type: 'string' } },
+      required: ['issue_key'],
+    },
+  }]]);
+
+  const result = await router._stageB_extractParams({
+    message: 'Add a description to the above task that we are integrating Jira to SwiftCollab through Atlassian',
+    stageA: {
+      selectedTools: [{ name: 'JIRA_UPDATE_ISSUE', sequence: 1, usePreviousOutput: false }],
+    },
+    selectedSchemas,
+    context: {
+      conversationHistory: [{ role: 'user', text: 'Assign Jira issue SCRUM-1 to me' }],
+    },
+  });
+
+  assert.equal(result.tools[0].params.issue_key, 'SCRUM-1');
+  assert.match(result.tools[0].params.description, /integrating Jira/i);
+});
+
+test('processPrompt reuses the conversation as its orchestration session', async () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  const sessionIds = [];
+  orchestrator.handleTurn = async input => {
+    sessionIds.push(input.sessionId);
+    return { type: 'chat', reply: 'ok' };
+  };
+
+  const input = {
+    message: 'first',
+    userId: 'user-1',
+    entityId: 'entity-1',
+    organizationId: 'org-1',
+    conversationId: 'conversation-1',
+  };
+  await orchestrator.processPrompt(input);
+  await orchestrator.processPrompt({ ...input, message: 'second' });
+
+  assert.equal(sessionIds[0], sessionIds[1]);
+  assert.match(sessionIds[0], /conversation-1$/);
+});
+
 test('reminder requests route to the connected calendar app', async () => {
   const router = Object.create(ToolRouter.prototype);
   router.MAX_RELEVANT_TOOLKITS = 10;

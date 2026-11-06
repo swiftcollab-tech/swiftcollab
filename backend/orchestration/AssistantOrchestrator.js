@@ -320,13 +320,19 @@ class AssistantOrchestrator {
     userId,
     entityId,
     organizationId = null,
+    conversationId = null,
     selectedToolkits = [],
     followupContext = null,
     answers = [],
     conversationHistory = [],
     onProgress = null,
   }) {
-    const sessionId = `sess_${entityId}_${Date.now()}`;
+    // The conversation is the durable orchestration boundary. Reusing its ID
+    // preserves slot-filling and confirmation state even if the browser loses
+    // the optional followupContext object between turns.
+    const sessionId = conversationId
+      ? `sess_${entityId}_${conversationId}`
+      : `sess_${entityId}_${Date.now()}`;
 
     // If we have followupContext with a sessionId, use that for continuity
     const effectiveSessionId = followupContext?.sessionId || sessionId;
@@ -346,6 +352,7 @@ class AssistantOrchestrator {
           userId,
           entityId,
           organizationId,
+          conversationId,
           conversationHistory,
           userTimeZone: followupContext?.userTimeZone || "America/New_York",
           onProgress,

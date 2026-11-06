@@ -2856,15 +2856,32 @@ OUTPUT JSON ONLY:
     // Do not let an LLM translate "me" into SwiftCollab's internal user UUID.
     // Jira requires the Atlassian account ID, which the native connector
     // resolves from the connected OAuth identity.
-    const explicitIssueKey = String(message || '').match(/\b[A-Z][A-Z0-9_]*-\d+\b/i)?.[0];
+    const normalizeIssueKey = value => {
+      const match = String(value || '').match(/\b([A-Z][A-Z0-9_]*)\s*-\s*(\d+)\b/i);
+      return match ? `${match[1].toUpperCase()}-${match[2]}` : null;
+    };
+    const explicitIssueKey = normalizeIssueKey(message);
+    const refersToPreviousIssue = /\b(?:above|previous|last|same|that|this)\s+(?:jira\s+)?(?:task|issue|ticket|story)\b/i.test(String(message || ''));
+    const recentIssueKey = refersToPreviousIssue
+      ? [...(context?.conversationHistory || [])]
+        .reverse()
+        .map(item => normalizeIssueKey(item?.text || item?.content || ''))
+        .find(Boolean)
+      : null;
+    const resolvedIssueKey = explicitIssueKey || recentIssueKey;
     const assignsToCurrentUser = /\bassign(?:ed|ment)?\b[\s\S]*\b(?:to\s+me|me)\b/i.test(String(message || ''));
-    if (explicitIssueKey && assignsToCurrentUser) {
-      tools = tools.map((tool) => tool.name === 'JIRA_UPDATE_ISSUE'
-        ? {
+    if (resolvedIssueKey) {
+      tools = tools.map((tool) => {
+        if (tool.name !== 'JIRA_UPDATE_ISSUE') return tool;
+        return {
           ...tool,
-          params: { ...tool.params, issue_key: explicitIssueKey.toUpperCase(), assignee: 'me' },
-        }
-        : tool);
+          params: {
+            ...tool.params,
+            issue_key: resolvedIssueKey,
+            ...(assignsToCurrentUser ? { assignee: 'me' } : {}),
+          },
+        };
+      });
     }
 
     tools.sort((a, b) => a.sequence - b.sequence);

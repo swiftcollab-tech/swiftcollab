@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS execution_plans (
 
     -- Plan definition
     plan_type VARCHAR(50) NOT NULL, -- single_action, multi_action, read_summarize_write, batch_update
+    template VARCHAR(50) NOT NULL DEFAULT 'DAG', -- execution strategy used to build the plan
     steps JSONB NOT NULL, -- Array of step definitions
 
     -- Execution state
