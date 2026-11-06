@@ -108,6 +108,7 @@ test('Jira issue identifiers and current-user assignment are provider compatible
   assert.equal(issueKeyFrom({ issue_id_or_key: 'SCRUM-2' }), 'SCRUM-2');
   assert.equal(isCurrentUserAssignee('me'), true);
   assert.equal(isCurrentUserAssignee('currentUser()'), true);
+  assert.equal(isCurrentUserAssignee('user-uuid-1', 'user-uuid-1'), true);
   assert.equal(isCurrentUserAssignee('account-id-1'), false);
   assert.ok(SCOPES.includes('read:jira-user'));
   assert.equal(ActionRegistry.isValidAction('JIRA_GET_ISSUE'), true);

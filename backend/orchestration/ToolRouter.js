@@ -2853,6 +2853,20 @@ OUTPUT JSON ONLY:
       usePreviousOutput: t.usePreviousOutput || uPByName.get(t.name) || false,
     }));
 
+    // Do not let an LLM translate "me" into SwiftCollab's internal user UUID.
+    // Jira requires the Atlassian account ID, which the native connector
+    // resolves from the connected OAuth identity.
+    const explicitIssueKey = String(message || '').match(/\b[A-Z][A-Z0-9_]*-\d+\b/i)?.[0];
+    const assignsToCurrentUser = /\bassign(?:ed|ment)?\b[\s\S]*\b(?:to\s+me|me)\b/i.test(String(message || ''));
+    if (explicitIssueKey && assignsToCurrentUser) {
+      tools = tools.map((tool) => tool.name === 'JIRA_UPDATE_ISSUE'
+        ? {
+          ...tool,
+          params: { ...tool.params, issue_key: explicitIssueKey.toUpperCase(), assignee: 'me' },
+        }
+        : tool);
+    }
+
     tools.sort((a, b) => a.sequence - b.sequence);
 
     // =========================================================================

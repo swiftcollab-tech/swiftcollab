@@ -486,14 +486,15 @@ const issueKeyFrom = params => value(
   'key'
 );
 
-function isCurrentUserAssignee(assignee) {
+function isCurrentUserAssignee(assignee, requestingUserId = null) {
   const normalized = String(assignee || '').trim().toLowerCase().replace(/\s+/g, '');
-  return ['me', 'myself', 'currentuser', 'currentuser()', 'current_user'].includes(normalized);
+  return ['me', 'myself', 'currentuser', 'currentuser()', 'current_user'].includes(normalized) ||
+    Boolean(requestingUserId && normalized === String(requestingUserId).trim().toLowerCase());
 }
 
-async function resolveAssignee(organizationId, siteSelector, assignee, fetchImpl) {
+async function resolveAssignee(organizationId, siteSelector, assignee, requestingUserId, fetchImpl) {
   if (assignee && typeof assignee === 'object' && assignee.accountId) return assignee.accountId;
-  if (!isCurrentUserAssignee(assignee)) return assignee;
+  if (!isCurrentUserAssignee(assignee, requestingUserId)) return assignee;
   const currentUser = await jiraRequest({ organizationId, siteSelector, path: 'myself', fetchImpl });
   if (!currentUser?.accountId) throw new Error('Jira did not return an account ID for the connected user');
   return currentUser.accountId;
@@ -514,7 +515,7 @@ async function transitionIssue(organizationId, siteSelector, issueKey, transitio
   });
 }
 
-async function executeAction({ organizationId, actionName, params = {}, fetchImpl = fetch }) {
+async function executeAction({ organizationId, actionName, params = {}, userId = null, fetchImpl = fetch }) {
   if (!organizationId) throw new Error('organizationId is required for the native Jira connector');
   const requestedAction = String(actionName || '').toUpperCase();
   const action = ACTION_ALIASES[requestedAction] || requestedAction;
@@ -542,7 +543,7 @@ async function executeAction({ organizationId, actionName, params = {}, fetchImp
     if (params.labels) fields.labels = params.labels;
     if (params.parent_key) fields.parent = { key: params.parent_key };
     if (params.assignee) {
-      fields.assignee = { accountId: await resolveAssignee(organizationId, siteSelector, params.assignee, fetchImpl) };
+      fields.assignee = { accountId: await resolveAssignee(organizationId, siteSelector, params.assignee, userId, fetchImpl) };
     }
     return jiraRequest({ organizationId, siteSelector, path: 'issue', method: 'POST', body: { fields }, fetchImpl });
   }
@@ -579,7 +580,7 @@ async function executeAction({ organizationId, actionName, params = {}, fetchImp
     if (params.priority !== undefined) fields.priority = { name: params.priority };
     if (params.labels !== undefined) fields.labels = params.labels;
     if (params.assignee !== undefined) {
-      const accountId = await resolveAssignee(organizationId, siteSelector, params.assignee, fetchImpl);
+      const accountId = await resolveAssignee(organizationId, siteSelector, params.assignee, userId, fetchImpl);
       await jiraRequest({
         organizationId,
         siteSelector,

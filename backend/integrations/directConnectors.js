@@ -56,8 +56,8 @@ const jiraConnector = {
   supportsAction(actionName) {
     return jira.supportsAction(actionName);
   },
-  async executeAction({ actionName, params, organizationId }) {
-    const data = await jira.executeAction({ organizationId, actionName, params });
+  async executeAction({ actionName, params, organizationId, userId }) {
+    const data = await jira.executeAction({ organizationId, actionName, params, userId });
     return { success: true, successful: true, data, error: null };
   },
   getTools() {

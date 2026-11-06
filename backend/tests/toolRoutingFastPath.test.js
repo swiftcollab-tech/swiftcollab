@@ -91,6 +91,41 @@ test('an explicit Jira assignment routes directly to the update action', async (
   ]);
 });
 
+test('Jira assignment preserves "me" instead of an internal SwiftCollab user ID', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'Asia/Calcutta';
+  router.callGemini = async () => JSON.stringify({
+    tools: [{
+      name: 'JIRA_UPDATE_ISSUE',
+      sequence: 1,
+      params: { issue_key: 'SCRUM-1', assignee: 'internal-user-uuid' },
+    }],
+    chatResponse: null,
+  });
+
+  const selectedSchemas = new Map([['JIRA_UPDATE_ISSUE', {
+    name: 'JIRA_UPDATE_ISSUE',
+    toolkit: 'JIRA',
+    parameters: {
+      type: 'object',
+      properties: { issue_key: { type: 'string' }, assignee: { type: 'string' } },
+      required: ['issue_key'],
+    },
+  }]]);
+
+  const result = await router._stageB_extractParams({
+    message: 'Assign Jira issue SCRUM-1 to me',
+    stageA: {
+      selectedTools: [{ name: 'JIRA_UPDATE_ISSUE', sequence: 1, usePreviousOutput: false }],
+    },
+    selectedSchemas,
+    context: { userId: 'internal-user-uuid' },
+  });
+
+  assert.equal(result.tools[0].params.issue_key, 'SCRUM-1');
+  assert.equal(result.tools[0].params.assignee, 'me');
+});
+
 test('reminder requests route to the connected calendar app', async () => {
   const router = Object.create(ToolRouter.prototype);
   router.MAX_RELEVANT_TOOLKITS = 10;
