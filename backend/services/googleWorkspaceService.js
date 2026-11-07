@@ -480,7 +480,7 @@ function getTools() {
     { name: 'GOOGLEDOCS_APPEND_TEXT', description: 'Append text to a Google Doc', parameters: object({ document_id: text('Google Doc document ID'), text: text('Text to append') }, ['document_id', 'text']) },
     { name: 'GOOGLESHEETS_CREATE_SPREADSHEET', description: 'Create a Google spreadsheet', parameters: object({ title: text('Spreadsheet title') }, ['title']) },
     { name: 'GOOGLESHEETS_GET_VALUES', description: 'Read values from a Google Sheet range', parameters: object({ spreadsheet_id: text('Spreadsheet ID or URL'), range: text('A1 notation range') }, ['spreadsheet_id', 'range']) },
-    { name: 'GOOGLESHEETS_APPEND_VALUES', description: 'Append rows to a Google Sheet', parameters: object({ spreadsheet_id: text('Spreadsheet ID or URL'), range: text('A1 notation range'), values: rows }, ['spreadsheet_id', 'range', 'values']) },
+    { name: 'GOOGLESHEETS_APPEND_VALUES', description: 'Append rows to a Google Sheet', parameters: object({ spreadsheet_id: text('Spreadsheet ID or URL'), range: { type: 'string', description: 'A1 notation range; defaults to the first sheet', default: 'Sheet1!A1' }, values: rows }, ['spreadsheet_id', 'values']) },
     { name: 'GOOGLESHEETS_UPDATE_VALUES', description: 'Update cells in a Google Sheet range', parameters: object({ spreadsheet_id: text('Spreadsheet ID or URL'), range: text('A1 notation range'), values: rows }, ['spreadsheet_id', 'range', 'values']) },
   ];
 }

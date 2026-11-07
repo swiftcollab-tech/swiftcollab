@@ -477,7 +477,21 @@ async function injectPreviousTaskData(task, taskResults, params) {
   if (task._injectResultTo && task._sourceTaskId) {
     const sourceResult = taskResults.get(task._sourceTaskId);
     if (sourceResult?.data) {
-      resolvedParams[task._injectResultTo] = formatDataForInjection(sourceResult.data, sourceResult.action);
+      const requestedPath = String(task._sourceResultPath || '')
+        .split('.')
+        .map(part => part.trim())
+        .filter(Boolean);
+      let injectedValue = requestedPath.reduce(
+        (value, part) => value !== null && value !== undefined ? value[part] : undefined,
+        sourceResult.data
+      );
+      if (injectedValue === undefined) {
+        injectedValue = findResourceField(sourceResult.data, task._injectResultTo, requestedPath.at(-1));
+      }
+      resolvedParams[task._injectResultTo] =
+        injectedValue !== undefined && (injectedValue === null || typeof injectedValue !== 'object')
+          ? injectedValue
+          : formatDataForInjection(injectedValue ?? sourceResult.data, sourceResult.action);
       console.log(`[Workflow] Explicit injection: ${task._sourceTaskId} → ${task._injectResultTo}`);
     }
   }
@@ -559,6 +573,36 @@ async function injectPreviousTaskData(task, taskResults, params) {
   }
 
   return resolvedParams;
+}
+
+/**
+ * Locate an identifier in a connector result without assuming one provider's
+ * response envelope. Kept deterministic because this runs inside a workflow.
+ */
+function findResourceField(payload, targetParam, requestedField) {
+  if (payload === null || payload === undefined) return undefined;
+  const camel = value => String(value || '').replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  const target = camel(targetParam);
+  const resource = target.replace(/(?:Id|Key|Url)$/i, '');
+  const candidates = new Set([
+    requestedField,
+    targetParam,
+    target,
+    `${resource}Id`,
+    `${resource}Key`,
+    `${resource}Url`,
+  ].filter(Boolean).map(value => String(value).toLowerCase()));
+  const queue = [{ value: payload, depth: 0 }];
+
+  while (queue.length) {
+    const { value, depth } = queue.shift();
+    if (!value || typeof value !== 'object' || depth > 4) continue;
+    for (const [key, child] of Object.entries(value)) {
+      if (candidates.has(key.toLowerCase()) && child !== null && child !== undefined) return child;
+      if (child && typeof child === 'object') queue.push({ value: child, depth: depth + 1 });
+    }
+  }
+  return undefined;
 }
 
 /**

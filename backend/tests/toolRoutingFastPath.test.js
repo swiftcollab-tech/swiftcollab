@@ -268,6 +268,14 @@ test('natural connection-list questions use the system status path', () => {
   }
 });
 
+test('a write request mentioning connected tools does not become a status check', () => {
+  const router = Object.create(ToolRouter.prototype);
+  assert.equal(
+    router._looksLikeConnectionStatusQuery('append the tools I tried to connect and the completed actions to the sheet'),
+    false
+  );
+});
+
 test('connection status discovers live Composio accounts', async () => {
   const executor = new ExecutorV2({
     composio: {
@@ -392,6 +400,91 @@ test('the action planner retains ten dynamic actions returned by the model', asy
   });
   assert.equal(result.selectedTools.length, 10);
   assert.deepEqual(result.selectedTools.map(tool => tool.name), availableTools.map(tool => tool.name));
+});
+
+test('the normal action planner never exposes the internal connection check tool', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'UTC';
+  router._parseJson = ToolRouter.prototype._parseJson;
+  router._nowContext = ToolRouter.prototype._nowContext;
+  router._isMultiActionRequest = ToolRouter.prototype._isMultiActionRequest;
+  router.callGemini = async systemPrompt => {
+    assert.doesNotMatch(systemPrompt, /SYSTEM_CHECK_CONNECTIONS/);
+    return JSON.stringify({ selectedTools: [{ name: 'GMAIL_SEND_EMAIL', sequence: 1 }] });
+  };
+  const result = await router._stageA_selectTools({
+    message: 'send an email',
+    availableTools: [
+      { name: 'SYSTEM_CHECK_CONNECTIONS', description: 'internal', toolkit: 'SYSTEM' },
+      { name: 'GMAIL_SEND_EMAIL', description: 'send email', toolkit: 'GMAIL' },
+    ],
+    context: {},
+  });
+  assert.deepEqual(result.selectedTools.map(tool => tool.name), ['GMAIL_SEND_EMAIL']);
+});
+
+test('preflight time overrides stay scoped to the calendar action', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'UTC';
+  router._inferToolkit = ToolRouter.prototype._inferToolkit;
+  router._extractTimeFromMessage = ToolRouter.prototype._extractTimeFromMessage;
+  router._getOffsetForTimeZone = ToolRouter.prototype._getOffsetForTimeZone;
+  router._getDateInTimezone = ToolRouter.prototype._getDateInTimezone;
+  const schemas = new Map([
+    ['GOOGLECALENDAR_CREATE_EVENT', { toolkit: 'GOOGLECALENDAR', parameters: { properties: { summary: {}, start: {}, end: {} }, required: ['summary', 'start', 'end'] } }],
+    ['GMAIL_SEND_EMAIL', { toolkit: 'GMAIL', parameters: { properties: { to: {}, subject: {}, body: {} }, required: ['to', 'subject', 'body'] } }],
+  ]);
+  const tools = [
+    { id: 't1', name: 'GOOGLECALENDAR_CREATE_EVENT', params: { summary: 'Onboarding', start: 'wrong', end: 'wrong' } },
+    { id: 't2', name: 'GMAIL_SEND_EMAIL', params: { to: 'user@example.com', subject: 'Welcome', body: 'Hello' } },
+  ];
+  const preflight = await router._runPreflight({
+    tools,
+    selectedSchemas: schemas,
+    availableTools: [],
+    context: { userTimeZone: 'Asia/Kolkata', entityId: 'user_1' },
+    message: 'schedule tomorrow at 2 pm IST',
+    connections: [],
+  });
+  const merged = router._mergePreflightResults(tools, preflight);
+  assert.match(merged[0].params.start, /14:00:00\+05:30$/);
+  assert.equal(merged[1].params.start, undefined);
+  assert.equal(merged[1].params.end, undefined);
+});
+
+test('a created resource is injected into a later action requiring its id', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._containsInjectMarker = ToolRouter.prototype._containsInjectMarker;
+  router._pickInjectionFieldFromSchema = ToolRouter.prototype._pickInjectionFieldFromSchema;
+  const schemas = new Map([
+    ['GOOGLESHEETS_CREATE_SPREADSHEET', { description: 'Create spreadsheet', parameters: { properties: { title: { type: 'string' } }, required: ['title'] } }],
+    ['GOOGLESHEETS_APPEND_VALUES', { description: 'Append rows to spreadsheet', parameters: { properties: { spreadsheet_id: { type: 'string' }, values: { type: 'array' } }, required: ['spreadsheet_id', 'values'] } }],
+  ]);
+  const result = router._enforceDataDependencies([
+    { name: 'GOOGLESHEETS_CREATE_SPREADSHEET', sequence: 1, params: { title: 'scheduled events' } },
+    { name: 'GOOGLESHEETS_APPEND_VALUES', sequence: 2, params: { values: [['Event', 'Status']] } },
+  ], schemas, 'create a spreadsheet and add the information there');
+  assert.deepEqual(result[1].dependsOn, [result[0].id]);
+  assert.equal(result[1].injectFrom.spreadsheet_id, `${result[0].id}.spreadsheetId`);
+  assert.equal(result[1].params.spreadsheet_id, '_inject_from_previous');
+});
+
+test('slot filler asks for one action-specific value per turn', () => {
+  const filler = Object.create(UnifiedSlotFiller.prototype);
+  const session = { askedKeys: new Set() };
+  const batch = filler._selectNextBatch(session, [
+    { toolId: 'calendar', field: 'summary' },
+    { toolId: 'sheet', field: 'title' },
+  ]);
+  assert.deepEqual(batch, [{ toolId: 'calendar', field: 'summary' }]);
+});
+
+test('executor finds a created resource id inside provider response envelopes', () => {
+  const executor = new ExecutorV2({ composio: {}, query: null });
+  assert.equal(
+    executor._findInjectionValue({ data: { result: { spreadsheetId: 'sheet-123' } } }, 'spreadsheet_id', ['spreadsheetId']),
+    'sheet-123'
+  );
 });
 
 test('slot filling preserves the exact routed provider schema', async () => {

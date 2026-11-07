@@ -859,6 +859,7 @@ class ExecutorV2 {
         action,
         params,
         dependsOn,
+        injectFrom: t.injectFrom && typeof t.injectFrom === "object" ? { ...t.injectFrom } : null,
         // Only assign parallelGroup to tasks that don't depend on previous results
         parallelGroup: hasDepOrNeedsData ? null : groupIdBySequence.get(seq),
         retryConfig: { maxRetries: 3, backoffMs: 1000 },
@@ -885,6 +886,9 @@ class ExecutorV2 {
       // Extract toolkit from action name (e.g., GMAIL_SEND_EMAIL -> GMAIL)
       const action = step.action || '';
       const toolkit = this._extractToolkitFromAction(action);
+      const injectionEntry = step.injectFrom ? Object.entries(step.injectFrom)[0] : null;
+      const sourceSpec = injectionEntry ? String(injectionEntry[1] || '') : '';
+      const [sourceTaskId, ...sourcePath] = sourceSpec.split('.');
 
       return {
         id: step.id,
@@ -895,8 +899,9 @@ class ExecutorV2 {
         toolkit: toolkit,
         optional: step.optional || false,
         // Include injection metadata for Temporal's injectPreviousTaskData
-        _injectResultTo: step.injectFrom ? Object.keys(step.injectFrom)[0] : null,
-        _sourceTaskId: step.injectFrom ? Object.values(step.injectFrom)[0]?.split('.')[0] : null,
+        _injectResultTo: injectionEntry?.[0] || null,
+        _sourceTaskId: sourceTaskId || null,
+        _sourceResultPath: sourcePath.join('.') || null,
         // Preserve metadata
         metadata: step.metadata || {},
       };
@@ -1684,6 +1689,10 @@ class ExecutorV2 {
       }
 
       if (payload === undefined) {
+        payload = this._findInjectionValue(originalPayload, targetParam, pathParts);
+      }
+
+      if (payload === undefined) {
         console.warn(
           `[ExecutorV2] Injection "${spec}" -> "${targetParam}" resulted in undefined. Available keys: ${originalPayload && typeof originalPayload === "object" ? Object.keys(originalPayload).join(", ") : "(none)"
           }`
@@ -1701,6 +1710,39 @@ class ExecutorV2 {
     }
 
     return out;
+  }
+
+  _findInjectionValue(payload, targetParam, requestedPath = []) {
+    if (payload === null || payload === undefined) return undefined;
+    const target = String(targetParam || '');
+    const camel = target.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+    const suffix = target.match(/(?:^|_)(id|key|url)$/i)?.[1]?.toLowerCase();
+    const base = target.replace(/(?:^|_)(?:id|key|url)$/i, '');
+    const baseCamel = base.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+    const requested = requestedPath[requestedPath.length - 1];
+    const candidates = [...new Set([
+      requested,
+      target,
+      camel,
+      suffix && baseCamel ? `${baseCamel}${suffix[0].toUpperCase()}${suffix.slice(1)}` : null,
+      suffix,
+    ].filter(Boolean))];
+
+    const queue = [{ value: payload, depth: 0 }];
+    while (queue.length > 0) {
+      const { value, depth } = queue.shift();
+      if (!value || typeof value !== 'object') continue;
+      for (const key of candidates) {
+        if (Object.prototype.hasOwnProperty.call(value, key) && value[key] !== undefined && value[key] !== null) {
+          return value[key];
+        }
+      }
+      if (depth >= 4) continue;
+      for (const nested of Object.values(value)) {
+        if (nested && typeof nested === 'object') queue.push({ value: nested, depth: depth + 1 });
+      }
+    }
+    return undefined;
   }
 
   _applySentinelInjection({ params, previousResults, step, targetAction }) {

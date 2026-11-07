@@ -1579,6 +1579,8 @@ Choose only connected names. Include EVERY app needed for every requested action
   async _runPreflight({ tools, selectedSchemas, availableTools, context, message, connections }) {
     const result = {
       autoFilled: {},
+      autoFilledByTool: {},
+      overridesByTool: {},
       availableOptions: {},
       suggestions: {},
     };
@@ -1597,6 +1599,14 @@ Choose only connected names. Include EVERY app needed for every requested action
     for (const tool of tools) {
       const schema = selectedSchemas.get(tool.name);
       if (!schema?.parameters) continue;
+
+      const toolKey = tool.id || tool.name;
+      const scopedResult = {
+        autoFilled: {},
+        availableOptions: {},
+        suggestions: {},
+      };
+      result.autoFilledByTool[toolKey] = scopedResult.autoFilled;
 
       const toolkit = schema.toolkit || this._inferToolkit(tool.name);
       const toolkitActions = actionsByToolkit.get(toolkit) || [];
@@ -1621,7 +1631,7 @@ Choose only connected names. Include EVERY app needed for every requested action
         const cacheKey = `${context.entityId}:${toolkit}:${preflightConfig.configKey}`;
         const cached = this._getPreflightCache(cacheKey);
         if (cached) {
-          this._applyPreflightData(result, paramName, cached, preflightConfig);
+          this._applyPreflightData(scopedResult, paramName, cached, preflightConfig);
           continue;
         }
 
@@ -1639,27 +1649,44 @@ Choose only connected names. Include EVERY app needed for every requested action
 
         if (items && items.length > 0) {
           this._setPreflightCache(cacheKey, items);
-          this._applyPreflightData(result, paramName, items, preflightConfig);
+          this._applyPreflightData(scopedResult, paramName, items, preflightConfig);
         } else if (
           preflightConfig.defaultValue !== null &&
           preflightConfig.defaultValue !== undefined
         ) {
-          result.autoFilled[paramName] = preflightConfig.defaultValue;
+          scopedResult.autoFilled[paramName] = preflightConfig.defaultValue;
         }
       }
+
+      for (const [field, value] of Object.entries(scopedResult.autoFilled)) {
+        result.autoFilled[`${toolKey}.${field}`] = value;
+      }
+      Object.assign(result.availableOptions, scopedResult.availableOptions);
+      Object.assign(result.suggestions, scopedResult.suggestions);
     }
 
-    // Extract time from message
+    // Explicit date/time belongs only to actions whose schema declares those
+    // fields. It must never be copied into email, Jira, Sheets, or system
+    // actions. Override model-produced calendar offsets with the user's actual
+    // browser timezone when the request contains an explicit time.
     const timeExtracted = this._extractTimeFromMessage(
       message,
       context.userTimeZone || context.timezone || this.USER_TIMEZONE
     );
     if (timeExtracted) {
-      if (!result.autoFilled.start_datetime) {
-        result.autoFilled.start_datetime = timeExtracted.start;
-      }
-      if (!result.autoFilled.end_datetime && timeExtracted.end) {
-        result.autoFilled.end_datetime = timeExtracted.end;
+      for (const tool of tools) {
+        const schema = selectedSchemas.get(tool.name)?.parameters;
+        const properties = schema?.properties || {};
+        const action = String(tool.name || '').toUpperCase();
+        if (!/CALENDAR/.test(action) || !/(CREATE|UPDATE).*EVENT|EVENT.*(CREATE|UPDATE)/.test(action)) continue;
+
+        const startField = ['start_datetime', 'start', 'start_time'].find(field => properties[field]);
+        const endField = ['end_datetime', 'end', 'end_time'].find(field => properties[field]);
+        const toolKey = tool.id || tool.name;
+        const overrides = result.overridesByTool[toolKey] || {};
+        if (startField) overrides[startField] = timeExtracted.start;
+        if (endField && timeExtracted.end) overrides[endField] = timeExtracted.end;
+        result.overridesByTool[toolKey] = overrides;
       }
     }
 
@@ -1816,8 +1843,10 @@ Choose only connected names. Include EVERY app needed for every requested action
   _mergePreflightResults(tools, preflightResult) {
     return tools.map((tool) => {
       const mergedParams = { ...tool.params };
+      const toolKey = tool.id || tool.name;
+      const scopedAutoFilled = preflightResult.autoFilledByTool?.[toolKey] || {};
 
-      for (const [param, value] of Object.entries(preflightResult.autoFilled)) {
+      for (const [param, value] of Object.entries(scopedAutoFilled)) {
         if (
           mergedParams[param] === undefined ||
           mergedParams[param] === null ||
@@ -1826,6 +1855,8 @@ Choose only connected names. Include EVERY app needed for every requested action
           mergedParams[param] = value;
         }
       }
+
+      Object.assign(mergedParams, preflightResult.overridesByTool?.[toolKey] || {});
 
       return { ...tool, params: mergedParams };
     });
@@ -2395,6 +2426,13 @@ Choose only connected names. Include EVERY app needed for every requested action
   _looksLikeConnectionStatusQuery(message) {
     const s = String(message || "").toLowerCase();
     if (!s) return false;
+    // A connected-app name can be part of the data the user wants to write
+    // (for example, "append the tools I connected to the sheet"). Such a
+    // request must continue the pending workflow instead of being replaced by
+    // the internal connection-status action.
+    const hasWorkVerb = /\b(append|write|create|add|update|edit|send|schedule|assign|post|upload|delete|remove)\b/i.test(s);
+    const explicitStatusLead = /^\s*(?:can you\s+)?(?:list|show|check|verify|which|what|are|is)\b/i.test(s);
+    if (hasWorkVerb && !explicitStatusLead) return false;
     const hasConnectionWord = /\b(connect(?:ed|ion)?|integrations?|oauth|auth|linked)\b/i.test(s);
     const hasCheckWord = /\b(check|status|verify|cross\s*check|working|configured|list|which|what|show|give)\b/i.test(s);
     // Also match direct "are my apps connected"
@@ -2412,7 +2450,11 @@ Choose only connected names. Include EVERY app needed for every requested action
     const timeZone = context?.userTimeZone || context?.timezone || this.USER_TIMEZONE;
     const now = this._nowContext(timeZone);
     const shortlist = availableTools
-      .filter(tool => !tool.name.includes('JQL') && !tool.name.includes('_JQL_'))
+      .filter(tool =>
+        tool.name !== 'SYSTEM_CHECK_CONNECTIONS' &&
+        !tool.name.includes('JQL') &&
+        !tool.name.includes('_JQL_')
+      )
       .map(tool => ({ name: tool.name, description: tool.description, toolkit: tool.toolkit }));
 
     const hasJiraUpdate = shortlist.some(tool => tool.name === 'JIRA_UPDATE_ISSUE');
@@ -2794,6 +2836,8 @@ GENERATED CONTENT (PROVIDER-NEUTRAL):
 - When the user explicitly asks SwiftCollab to write, draft, compose, summarize, or generate content, generate it now for semantic content fields such as subject, body, text, message, description, comment, content, notes, title, summary, or row values.
 - Follow the user's requested tone, facts, audience, and word/character length. If the user gives an exact length, generate that exact length. A request for a warm 200-word welcome email therefore needs a generated subject and 200-word body; it is not a missing-value question.
 - Content generation does NOT permit inventing recipients, account IDs, project keys, issue keys, dates, permissions, or other external identifiers.
+- When the user says create an item "named", "called", "titled", or "as" a value, map that value to the matching title/name/summary field for THAT action. Keep each action's name separate: a spreadsheet title must not become a calendar summary, and a meeting title must not become a document title.
+- Infer a concise title from the requested activity when it is unambiguous. For example, "schedule an onboarding call" has summary "Onboarding call" and "create a sheet named scheduled events" has title "scheduled events". Do not ask for those values again.
 
 REFERENCE RESOLUTION:
 - If user says "the same", "same person", "with them", resolve to the value mentioned earlier in the SAME message.
@@ -2831,7 +2875,7 @@ CRITICAL - DO NOT INVENT VALUES:
 
 CALENDAR EVENT RULES:
 - For GOOGLECALENDAR_CREATE_EVENT, the following are REQUIRED:
-  * summary: The title of the meeting (if user says "meeting with X", set summary: null - ask them for title)
+  * summary: Use the requested activity as the title when it is clear (for example, "onboarding call" or "project review"). Ask only when no purpose/title can be inferred.
   * start_datetime: ONLY set if user provides specific time (e.g., "at 3pm", "tomorrow at 2pm")
   * end_datetime: ONLY set if user provides duration/end time, otherwise set null
 - If user says "schedule a meeting with X" without time, set start_datetime: null, end_datetime: null
@@ -3123,6 +3167,54 @@ OUTPUT JSON ONLY:
       }
     }
 
+    // Connect a created resource to a later action that requires that
+    // resource's identifier. This is schema/action-name driven and works for
+    // patterns such as spreadsheet -> append rows, document -> append text,
+    // issue -> add comment, folder -> create file, and similar connectors.
+    for (let consumerIndex = 0; consumerIndex < sortedTools.length; consumerIndex++) {
+      const consumer = sortedTools[consumerIndex];
+      const consumerSchema = selectedSchemas.get(consumer.name)?.parameters;
+      const properties = consumerSchema?.properties || {};
+      const required = new Set(consumerSchema?.required || []);
+
+      for (const field of Object.keys(properties)) {
+        if (!required.has(field) || !/(?:^|_)(?:id|key|url)$/i.test(field)) continue;
+        const current = consumer.params?.[field];
+        if (current !== undefined && current !== null && current !== '') continue;
+
+        const base = field
+          .replace(/(?:^|_)(?:id|key|url)$/i, '')
+          .replace(/_/g, '')
+          .toLowerCase();
+        if (!base) continue;
+
+        const producer = sortedTools
+          .slice(0, consumerIndex)
+          .reverse()
+          .find(candidate => {
+            if (!/\bCREATE\b/i.test(String(candidate.name || '').replace(/_/g, ' '))) return false;
+            const candidateText = `${candidate.name} ${selectedSchemas.get(candidate.name)?.description || ''}`
+              .replace(/[^a-z0-9]/gi, '')
+              .toLowerCase();
+            return candidateText.includes(base);
+          });
+        if (!producer) continue;
+
+        const sourceField = field.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase());
+        consumer.dependsOn = [...new Set([...(consumer.dependsOn || []), producer.id])];
+        consumer.injectFrom = {
+          ...(consumer.injectFrom || {}),
+          [field]: `${producer.id}.${sourceField}`,
+        };
+        consumer.params = {
+          ...(consumer.params || {}),
+          [field]: '_inject_from_previous',
+        };
+        consumer.usePreviousOutput = true;
+        console.log(`[ToolRouter] Resource dependency: ${producer.name} -> ${consumer.name}.${field}`);
+      }
+    }
+
     // Find producers and consumers
     const producers = [];
     const consumers = new Set();
@@ -3244,6 +3336,7 @@ OUTPUT JSON ONLY:
         sequence: t.sequence || i + 1,
         dependsOn: Array.isArray(t.dependsOn) ? [...new Set(t.dependsOn)] : [],
         usePreviousOutput: !!t.usePreviousOutput,
+        injectFrom: t.injectFrom && typeof t.injectFrom === 'object' ? { ...t.injectFrom } : null,
       };
 
       if (!schema) return out;

@@ -198,7 +198,8 @@ class UnifiedSlotFiller {
       context: {
         ...context,
         originalMessage: context.originalMessage || context.message || null,
-        now: this._nowContext(),
+        userTimeZone: context.userTimeZone || context.timezone || this.USER_TZ,
+        now: this._nowContext(context.userTimeZone || context.timezone || this.USER_TZ),
       },
 
       // Multi-tool chain
@@ -801,54 +802,17 @@ class UnifiedSlotFiller {
    * Enhanced to prefer grouping fields from the same tool for clarity.
    */
   _selectNextBatch(session, requiredMissingSorted) {
-    const maxN = this.config.maxFieldsPerQuestion;
-    const batch = [];
-
-    // Group missing fields by tool
-    const byTool = new Map();
+    // Ask for exactly one tool-scoped value at a time. A response such as
+    // "Welcome onboarding call" must not be copied into both a Calendar title
+    // and a Spreadsheet title merely because both were missing together.
     for (const m of requiredMissingSorted) {
       const key = `${m.toolId}.${m.field}`;
       if (session.askedKeys.has(key)) continue;
-
-      if (!byTool.has(m.toolId)) {
-        byTool.set(m.toolId, []);
-      }
-      byTool.get(m.toolId).push(m);
+      session.askedKeys.add(key);
+      return [m];
     }
 
-    // Strategy: Ask about one tool at a time if possible
-    // This reduces user confusion with multi-tool chains
-    if (byTool.size > 0) {
-      // Get the first tool with missing fields
-      const firstToolFields = byTool.values().next().value;
-
-      // Take up to maxN fields from this tool
-      for (const m of firstToolFields) {
-        batch.push(m);
-        if (batch.length >= maxN) break;
-      }
-
-      // If we have room and this tool is done, add from next tool
-      if (batch.length < maxN && batch.length === firstToolFields.length) {
-        const allFields = Array.from(byTool.values()).flat();
-        for (const m of allFields) {
-          if (batch.includes(m)) continue;
-          batch.push(m);
-          if (batch.length >= maxN) break;
-        }
-      }
-    }
-
-    // Fallback: if everything was asked, take top N anyway
-    if (batch.length === 0) {
-      batch.push(...requiredMissingSorted.slice(0, maxN));
-    }
-
-    for (const m of batch) {
-      session.askedKeys.add(`${m.toolId}.${m.field}`);
-    }
-
-    return batch;
+    return requiredMissingSorted.length > 0 ? [requiredMissingSorted[0]] : [];
   }
 
   /**
@@ -921,10 +885,11 @@ class UnifiedSlotFiller {
       enum: Array.isArray(m.enum) ? m.enum.slice(0, 10) : null,
     }));
 
+    const timeZone = session.context.userTimeZone || this.USER_TZ;
     const systemPrompt = `You write short, friendly, NATURAL clarification questions like a helpful assistant.
 
 CURRENT TIME:
-- timezone: ${this.USER_TZ}
+- timezone: ${timeZone}
 - today: ${now.today}
 - tomorrow: ${now.tomorrow}
 
@@ -1066,10 +1031,11 @@ ${JSON.stringify(compact, null, 2)}
       enum: Array.isArray(m.enum) ? m.enum.slice(0, 15) : null,
     }));
 
+    const timeZone = session.context.userTimeZone || this.USER_TZ;
     const systemPrompt = `You extract structured parameters from user text.
 
 CURRENT TIME:
-- timezone: ${this.USER_TZ}
+- timezone: ${timeZone}
 - now: ${now.nowRfc3339}
 - today: ${now.today}
 - tomorrow: ${now.tomorrow}
@@ -1089,6 +1055,7 @@ CRITICAL RULES:
 5) If type is array: output array.
 6) If enum exists: choose EXACT enum value.
 7) Do not invent IDs/emails/channels. If not present, omit.
+8) For an array whose item type is also array, return a two-dimensional table of rows. You may structure facts explicitly present in the original request and already collected tool parameters into clear headers and rows.
 
 Return only what you can extract confidently.`;
 
@@ -1100,6 +1067,12 @@ ${JSON.stringify(fields, null, 2)}
 
 Regex hints (high-confidence):
 ${JSON.stringify(regexHints, null, 2)}
+
+Original request:
+${JSON.stringify(session.context.originalMessage || '')}
+
+Already collected tool parameters:
+${JSON.stringify(this._buildToolsToExecute(session), null, 2)}
 `;
 
     try {
@@ -1141,7 +1114,10 @@ ${JSON.stringify(regexHints, null, 2)}
       // Look for array-type fields (like items) - these likely want the user's item names
       const arrayField = fields.find(f => f.type === 'array');
       if (arrayField && response) {
-        fallback[toolId][arrayField.field] = response;
+        const fieldSchema = session.schemaByToolId[toolId]?.properties?.[arrayField.field];
+        fallback[toolId][arrayField.field] = fieldSchema?.items?.type === 'array'
+          ? [[response]]
+          : [response];
         console.log(`[SlotFiller] Fallback assigned "${response}" to array field: ${arrayField.field}`);
         continue;
       }
@@ -1198,6 +1174,10 @@ ${JSON.stringify(regexHints, null, 2)}
           console.log(`[SlotFiller] Coerced ${field} from string to array:`, finalValue);
         }
 
+        if (fieldSchema.type === 'array' && fieldSchema.items?.type === 'array' && Array.isArray(finalValue)) {
+          finalValue = finalValue.map(row => Array.isArray(row) ? row : [row]);
+        }
+
         coerced[field] = finalValue;
       }
 
@@ -1221,6 +1201,7 @@ ${JSON.stringify(regexHints, null, 2)}
         params: { ...(session.filledByToolId[t.id] || {}) },
         dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.slice() : [],
         usePreviousOutput: !!t.usePreviousOutput,
+        injectFrom: t.injectFrom && typeof t.injectFrom === 'object' ? { ...t.injectFrom } : null,
       }));
   }
 
@@ -1260,7 +1241,12 @@ ${JSON.stringify(regexHints, null, 2)}
       lines.push(`**${friendlyName}:**`);
       for (const k of visibleKeys.slice(0, 6)) {
         let v = t.params[k];
-        if (Array.isArray(v)) v = v.join(", ");
+        if (Array.isArray(v)) {
+          v = v.map(item => {
+            if (!item || typeof item !== 'object') return item;
+            return item.email || item.name || JSON.stringify(item);
+          }).join(", ");
+        }
         if (typeof v === "string" && v.length > 60) v = v.slice(0, 60) + "...";
         // Use friendly field name
         const friendlyField = this._friendlyFieldName(k);
@@ -1792,6 +1778,9 @@ ${JSON.stringify(regexHints, null, 2)}
         const params = (!isString && t?.params && typeof t.params === "object") ? { ...t.params } : {};
         const dependsOn = (!isString && Array.isArray(t?.dependsOn)) ? t.dependsOn.slice() : [];
         const usePreviousOutput = !isString && !!t?.usePreviousOutput;
+        const injectFrom = (!isString && t?.injectFrom && typeof t.injectFrom === 'object')
+          ? { ...t.injectFrom }
+          : null;
 
         return {
           id: isString ? `tool_${sequence}_${t.trim()}` : (t?.id || `tool_${sequence}_${name}`),
@@ -1801,6 +1790,7 @@ ${JSON.stringify(regexHints, null, 2)}
           params,
           dependsOn,
           usePreviousOutput,
+          injectFrom,
         };
       })
       .filter((t) => t.name);
@@ -1810,12 +1800,12 @@ ${JSON.stringify(regexHints, null, 2)}
   // DATE/TIME CONTEXT (timezone-aware hints)
   // =============================================================================
 
-  _nowContext() {
+  _nowContext(timeZone = this.USER_TZ) {
     const now = new Date();
-    const today = this._formatDateInTz(now, this.USER_TZ);
-    const tomorrow = this._formatDateInTz(new Date(now.getTime() + 86400000), this.USER_TZ);
-    const yesterday = this._formatDateInTz(new Date(now.getTime() - 86400000), this.USER_TZ);
-    const offset = this._getOffsetForTimeZone(now, this.USER_TZ);
+    const today = this._formatDateInTz(now, timeZone);
+    const tomorrow = this._formatDateInTz(new Date(now.getTime() + 86400000), timeZone);
+    const yesterday = this._formatDateInTz(new Date(now.getTime() - 86400000), timeZone);
+    const offset = this._getOffsetForTimeZone(now, timeZone);
 
     // We keep ISO UTC too for reference, but we instruct model to output RFC3339 with tz.
     const nowRfc3339 = now.toISOString().replace(".000", "Z"); // already Z

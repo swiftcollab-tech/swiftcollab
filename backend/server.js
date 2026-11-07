@@ -318,7 +318,7 @@ async function bootstrapOrchestration() {
     composioToolSet: composioService,
     callGemini,
     options: {
-      maxQuestionRounds: 5,
+      maxQuestionRounds: 20,
       progressiveDisclosure: true,
       userTimeZone: 'UTC',
     },

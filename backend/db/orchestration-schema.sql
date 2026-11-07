@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS conversation_states (
 CREATE TABLE IF NOT EXISTS execution_plans (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    conversation_id UUID REFERENCES conversation_states(id) ON DELETE SET NULL,
+    conversation_id UUID REFERENCES chat_conversations(id) ON DELETE SET NULL,
 
     -- Plan definition
     plan_type VARCHAR(50) NOT NULL, -- single_action, multi_action, read_summarize_write, batch_update
