@@ -308,7 +308,7 @@ async function bootstrapOrchestration() {
     frappeService,
     query,
     options: {
-      userTimeZone: 'America/New_York',
+      userTimeZone: 'UTC',
       cacheTtlMs: 5 * 60 * 1000,
     },
   });
@@ -320,6 +320,7 @@ async function bootstrapOrchestration() {
     options: {
       maxQuestionRounds: 5,
       progressiveDisclosure: true,
+      userTimeZone: 'UTC',
     },
   });
 

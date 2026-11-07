@@ -2,7 +2,9 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const ToolRouter = require('../orchestration/ToolRouter');
 const AssistantOrchestrator = require('../orchestration/AssistantOrchestrator');
+const AssistantComposer = require('../orchestration/AssistantComposer');
 const { ExecutorV2 } = require('../orchestration/executorV2');
+const UnifiedSlotFiller = require('../orchestration/unified/UnifiedSlotFiller');
 const { classifyToolIntent } = require('../orchestration/core/ToolIntentGate');
 
 test('greetings use the immediate chat path', () => {
@@ -229,6 +231,21 @@ test('high-confidence reminder requests select create-event without an LLM', () 
   assert.equal(result.selectedTools[0].name, 'GOOGLECALENDAR_CREATE_EVENT');
 });
 
+test('a calendar phrase cannot collapse a dynamic multi-app request', () => {
+  const router = Object.create(ToolRouter.prototype);
+  const tools = [
+    { name: 'GMAIL_SEND_EMAIL', description: 'Send email', toolkit: 'GMAIL' },
+    { name: 'GOOGLECALENDAR_CREATE_EVENT', description: 'Create event', toolkit: 'GOOGLECALENDAR' },
+    { name: 'GOOGLESHEETS_CREATE_SPREADSHEET', description: 'Create sheet', toolkit: 'GOOGLESHEETS' },
+    { name: 'JIRA_UPDATE_ISSUE', description: 'Update issue', toolkit: 'JIRA' },
+  ];
+  const result = router._deterministicToolSelection(
+    'Send a welcome email, schedule a meeting tomorrow, update a Google Sheet, and comment on Jira',
+    tools
+  );
+  assert.equal(result, null);
+});
+
 test('short action follow-ups retain tool context', () => {
   const history = [
     { role: 'user', text: 'Find my GitHub repositories' },
@@ -330,6 +347,149 @@ test('explicit cross-app requests select only relevant apps from 12 connections'
   );
 
   assert.deepEqual(selected, ['GITHUB', 'GMAIL']);
+});
+
+test('explicit requests retain ten connected applications in one plan', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.MAX_RELEVANT_TOOLKITS = 12;
+  router.callGemini = async () => { throw new Error('LLM should not be needed'); };
+  const connected = [
+    'GITHUB', 'GMAIL', 'GOOGLECALENDAR', 'GOOGLESHEETS', 'SLACK',
+    'JIRA', 'ASANA', 'TRELLO', 'NOTION', 'SALESFORCE', 'ZOOM', 'DROPBOX',
+  ];
+  const selected = await router._selectRelevantToolkits(
+    'Create work in GitHub, Gmail, Google Calendar, Google Sheets, Slack, Jira, Asana, Trello, Notion, and Salesforce',
+    connected
+  );
+  assert.deepEqual(selected, connected.slice(0, 10));
+});
+
+test('the action planner retains ten dynamic actions returned by the model', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'UTC';
+  router._parseJson = ToolRouter.prototype._parseJson;
+  router._nowContext = ToolRouter.prototype._nowContext;
+  router._isMultiActionRequest = ToolRouter.prototype._isMultiActionRequest;
+  const availableTools = Array.from({ length: 10 }, (_, index) => ({
+    name: `APP_${index + 1}_CREATE_ITEM`,
+    description: `Create an item in app ${index + 1}`,
+    toolkit: `APP_${index + 1}`,
+  }));
+  router.callGemini = async systemPrompt => {
+    assert.match(systemPrompt, /10 or more different apps/);
+    return JSON.stringify({
+      selectedTools: availableTools.map((tool, index) => ({
+        name: tool.name,
+        sequence: index < 5 ? 1 : 2,
+        usePreviousOutput: index >= 5,
+      })),
+    });
+  };
+  const result = await router._stageA_selectTools({
+    message: 'Perform all ten requested app actions',
+    availableTools,
+    context: { userTimeZone: 'Asia/Kolkata' },
+  });
+  assert.equal(result.selectedTools.length, 10);
+  assert.deepEqual(result.selectedTools.map(tool => tool.name), availableTools.map(tool => tool.name));
+});
+
+test('slot filling preserves the exact routed provider schema', async () => {
+  let composioSchemaLookups = 0;
+  const filler = new UnifiedSlotFiller({
+    composioToolSet: {
+      getToolsForToolkit: async () => {
+        composioSchemaLookups += 1;
+        return [{
+          name: 'GMAIL_SEND_EMAIL',
+          parameters: { required: ['to', 'body', 'extra_recipients'] },
+        }];
+      },
+    },
+    callGemini: async () => '',
+  });
+  const routedSchema = {
+    type: 'object',
+    properties: {
+      to: { type: 'string' },
+      subject: { type: 'string' },
+      body: { type: 'string' },
+    },
+    required: ['to', 'body'],
+  };
+  const session = await filler.startSession('native_schema_test', {
+    tools: [{ name: 'GMAIL_SEND_EMAIL', composio_action: 'GMAIL_SEND_EMAIL', params: {} }],
+    schemas: { GMAIL_SEND_EMAIL: routedSchema },
+  });
+  assert.equal(composioSchemaLookups, 0);
+  assert.equal(session.schemaByToolId[session.tools[0].id], routedSchema);
+});
+
+test('parameter planning allows requested content generation without inventing identifiers', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'Asia/Kolkata';
+  router._parseJson = ToolRouter.prototype._parseJson;
+  router._formatContextForPrompt = () => '';
+  router._nowContext = ToolRouter.prototype._nowContext;
+  router._inferToolkit = ToolRouter.prototype._inferToolkit;
+  router.callGemini = async systemPrompt => {
+    assert.match(systemPrompt, /GENERATED CONTENT \(PROVIDER-NEUTRAL\)/);
+    assert.match(systemPrompt, /warm 200-word welcome email/);
+    return JSON.stringify({
+      tools: [{
+        name: 'GMAIL_SEND_EMAIL',
+        sequence: 1,
+        params: {
+          to: 'new.user@example.com',
+          subject: 'Welcome to SwiftCollab',
+          body: 'Welcome '.repeat(200).trim(),
+        },
+      }],
+    });
+  };
+  const selectedSchemas = new Map([['GMAIL_SEND_EMAIL', {
+    name: 'GMAIL_SEND_EMAIL',
+    toolkit: 'GMAIL',
+    parameters: {
+      type: 'object',
+      properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
+      required: ['to', 'body'],
+    },
+  }]]);
+  const result = await router._stageB_extractParams({
+    message: 'Send new.user@example.com a warm welcome email with a 200 word body',
+    selectedSchemas,
+    stageA: { selectedTools: [{ name: 'GMAIL_SEND_EMAIL', sequence: 1, usePreviousOutput: false }] },
+    context: {},
+  });
+  assert.equal(result.tools[0].params.to, 'new.user@example.com');
+  assert.match(result.tools[0].params.body, /Welcome/);
+});
+
+test('confirmation and execution summaries never hide later actions', async () => {
+  const tools = Array.from({ length: 10 }, (_, index) => ({
+    name: `APP_${index + 1}_CREATE_ITEM`,
+    composio_action: `APP_${index + 1}_CREATE_ITEM`,
+    params: {},
+  }));
+  const composer = new AssistantComposer({
+    callGemini: async () => 'Only one action\n\nReady?',
+  });
+  const confirmation = await composer.composeConfirmationMessage({ tools, originalMessage: 'run all ten' });
+  assert.match(confirmation, /10 actions/);
+  assert.match(confirmation, /10\. APP_10_CREATE_ITEM/);
+
+  const execution = await composer.composeExecutionDeterministic({
+    executionResult: {
+      results: tools.map((tool, index) => ({
+        action: tool.name,
+        success: false,
+        error: `failure ${index + 1}`,
+      })),
+    },
+  });
+  assert.match(execution, /APP_1_CREATE_ITEM: failure 1/);
+  assert.match(execution, /APP_10_CREATE_ITEM: failure 10/);
 });
 
 test('ambiguous requests use a compact app-name selection step', async () => {

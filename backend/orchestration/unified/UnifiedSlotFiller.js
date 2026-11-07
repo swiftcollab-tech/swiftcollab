@@ -47,7 +47,7 @@ class UnifiedSlotFiller {
     confirmationThreshold: 0.75,
     enableLLMFallback: true,
     progressiveDisclosure: true, // ask required first, optional later (currently only required)
-    userTimeZone: "America/New_York",
+    userTimeZone: "UTC",
     schemaCacheTtlMs: 10 * 60 * 1000,
     maxIterationsInStateLoop: 30,
     // If we cannot resolve missing required fields after max rounds, we offer defaults if any exist, else cannot complete.
@@ -175,11 +175,17 @@ class UnifiedSlotFiller {
 
     const tools = this._normalizeTools(routingResult.tools);
 
-    // Fetch schemas (dynamic) for each tool action
-    // Pass context for user-specific schemas (e.g., Frappe per-user connections)
+    // Prefer the exact provider schemas selected by ToolRouter. Looking up an
+    // action again by its name can switch providers (native -> Composio) and
+    // introduce fields that the chosen executor does not accept.
+    const routedSchemas = routingResult.schemas && typeof routingResult.schemas === "object"
+      ? routingResult.schemas
+      : {};
     const schemaByToolId = {};
     for (const t of tools) {
-      schemaByToolId[t.id] = await this._getSchemaForAction(t.composio_action, context);
+      schemaByToolId[t.id] = routedSchemas[t.name] ||
+        routedSchemas[t.composio_action] ||
+        await this._getSchemaForAction(t.composio_action, context);
     }
 
     const session = {

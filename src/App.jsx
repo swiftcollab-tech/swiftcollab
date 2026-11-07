@@ -1074,6 +1074,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     const baseBody = {
       selectedApps: selectedAppIds,
       conversationId: activeConversationId,
+      userTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
       ...payload,
     };
 

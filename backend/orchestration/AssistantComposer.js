@@ -112,11 +112,6 @@ RULES:
     const successful = results.filter((r) => r && r.success);
     const failed = results.filter((r) => r && !r.success);
 
-    if (successful.length === 0 && failed.length > 0) {
-      const first = failed[0];
-      return `I couldn't complete that. ${first.error || "Something went wrong."}`.trim();
-    }
-
     const lines = [];
 
     for (const step of successful) {
@@ -159,8 +154,10 @@ RULES:
       );
     }
 
-    if (failed.length > 0) {
-      lines.push(`Failed: ${failed.map((f) => f.error || "Unknown error").join("; ")}`);
+    for (const step of failed) {
+      const action = step.action || "task";
+      const status = step.status === "skipped" ? "Skipped" : "Failed";
+      lines.push(`❌ ${status} ${action}: ${step.error || "Unknown error"}`);
     }
 
     return lines.filter(Boolean).join("\n");
@@ -305,14 +302,15 @@ RULES:
 
 USER SAID: "${originalMessage || 'do this'}"
 
-WHAT HAPPENS:
-${grouped.map((g) => `${g.emoji} ${g.description}`).join('\n')}
+WHAT HAPPENS (${grouped.length} actions):
+${grouped.map((g, index) => `${index + 1}. ${g.emoji} ${g.description}`).join('\n')}
 
 STYLE:
 - Be CASUAL like texting a friend
 - NO robotic phrases: "I'll", "I'm going to", "I'm ready to proceed"
 - Just list what happens, present tense
-- Keep it SHORT (2-4 lines)
+- Include EVERY numbered action exactly once; never summarize away or omit later actions
+- Keep each action to one short line, followed by one confirmation question
 - End with "Ready?" or "Confirm?" or "Sound good?"
 
 BAD EXAMPLE (too robotic):
@@ -334,6 +332,13 @@ Write ONLY the message.`;
 
       if (!text) {
         console.warn('[AssistantComposer] LLM returned empty response, using fallback');
+        return deterministicMsg;
+      }
+
+      const numberedActions = text.split(/\r?\n/)
+        .filter(line => /^\s*\d+[.)]\s+/.test(line)).length;
+      if (grouped.length > 1 && numberedActions < grouped.length) {
+        console.warn('[AssistantComposer] LLM omitted planned actions, using complete fallback');
         return deterministicMsg;
       }
 
@@ -460,15 +465,11 @@ Write ONLY the message.`;
       return t.name || 'perform an action';
     });
 
-    const unique = [...new Set(actionTypes)];
-    if (unique.length === 1) {
-      return `I'll ${unique[0]}. Ready to proceed? (yes/no)`;
-    }
-    if (unique.length <= 3) {
-      const last = unique.pop();
-      return `I'll ${unique.join(', ')} and ${last}. Ready to proceed? (yes/no)`;
-    }
-    return `I'll perform ${count} actions. Ready to proceed? (yes/no)`;
+    return [
+      `Please confirm these ${count} actions:`,
+      ...actionTypes.map((action, index) => `${index + 1}. ${action}`),
+      'Ready to proceed? (yes/no)',
+    ].join('\n');
   }
 }
 

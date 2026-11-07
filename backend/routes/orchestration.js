@@ -56,6 +56,16 @@ function determineEventType(app, payload) {
   }
 }
 
+function normalizeUserTimeZone(value) {
+  if (typeof value !== 'string' || value.length > 100) return 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+    return value;
+  } catch (_) {
+    return 'UTC';
+  }
+}
+
 function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optionalAuth, composioService = null, connectorService = null) {
   const router = express.Router();
 
@@ -78,6 +88,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
         answers,
         conversationId,
         userResponse,
+        userTimeZone,
       } = req.body || {};
 
       const userId = req.user.userId;
@@ -145,6 +156,7 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
           role: item.role,
           text: item.content,
         })),
+        userTimeZone: normalizeUserTimeZone(userTimeZone),
         onProgress: event => emit('progress', event),
       });
 

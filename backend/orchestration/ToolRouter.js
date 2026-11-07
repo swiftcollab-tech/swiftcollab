@@ -48,14 +48,17 @@ class ToolRouter {
 
     // Safety limits
     this.MAX_TOOLS_PER_TOOLKIT = options.maxToolsPerToolkit ?? 80;
-    this.MAX_ROUTER_CANDIDATES = options.maxRouterCandidates ?? 30;
-    this.MAX_RELEVANT_TOOLKITS = options.maxRelevantToolkits ?? 10;
+    // Keep enough room for a genuine cross-app request. Twelve toolkits and
+    // sixty candidate actions lets one prompt span 10+ apps without allowing
+    // an unbounded catalog to reach the planner.
+    this.MAX_ROUTER_CANDIDATES = options.maxRouterCandidates ?? 60;
+    this.MAX_RELEVANT_TOOLKITS = options.maxRelevantToolkits ?? 12;
     this.MAX_ENABLED_TOOLKITS = Number.isFinite(options.maxEnabledToolkits)
       ? options.maxEnabledToolkits
       : null;
 
     // User timezone for prompt context
-    this.USER_TIMEZONE = options.userTimeZone ?? "America/New_York";
+    this.USER_TIMEZONE = options.userTimeZone ?? "UTC";
 
     // Toolkit to app name mapping for connection validation
     this.TOOLKIT_TO_APP = {
@@ -75,7 +78,9 @@ class ToolRouter {
       LINEAR: "linear",
       DISCORD: "discord",
       DROPBOX: "dropbox",
-      GOOGLE_DRIVE: "googledrive",
+      GOOGLEDRIVE: "googledrive",
+      GOOGLEDOCS: "googledocs",
+      GOOGLESHEETS: "googlesheets",
       AIRTABLE: "airtable",
       MONDAY: "monday",
       CLICKUP: "clickup",
@@ -553,6 +558,12 @@ class ToolRouter {
         unresolved: entityResult.unresolved,
       },
       _connections: connectionResult,
+      // The slot filler must validate against the same provider schema used
+      // by the router. Re-fetching by action name can silently swap a native
+      // connector schema for a Composio schema with different fields.
+      schemas: Object.fromEntries(
+        [...selectedSchemas.entries()].map(([name, tool]) => [name, tool?.parameters || null])
+      ),
     };
 
     // Enhance clarification with preflight options
@@ -695,6 +706,7 @@ class ToolRouter {
       NOTION: ['notion', 'page', 'database', 'document'],
       GOOGLEDRIVE: ['google drive', 'drive', 'file', 'document'],
       GOOGLEDOCS: ['google docs', 'document'],
+      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet', 'worksheet'],
       DROPBOX: ['dropbox', 'file'],
       HUBSPOT: ['hubspot', 'contact', 'deal', 'company'],
       SALESFORCE: ['salesforce', 'lead', 'contact', 'opportunity', 'account'],
@@ -725,6 +737,7 @@ class ToolRouter {
       NOTION: ['notion'],
       GOOGLEDRIVE: ['google drive'],
       GOOGLEDOCS: ['google docs'],
+      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet'],
       DROPBOX: ['dropbox'],
       HUBSPOT: ['hubspot'],
       SALESFORCE: ['salesforce'],
@@ -742,6 +755,7 @@ class ToolRouter {
       { pattern: /\b(repository|repo|pull request|merge request|commit)\b/i, toolkits: ['GITHUB', 'GITLAB', 'BITBUCKET'] },
       { pattern: /\b(channel|chat message|notify the team)\b/i, toolkits: ['SLACK', 'MICROSOFTTEAMS', 'DISCORD'] },
       { pattern: /\b(file|document|folder)\b/i, toolkits: ['GOOGLEDRIVE', 'GOOGLEDOCS', 'DROPBOX', 'NOTION'] },
+      { pattern: /\b(spreadsheet|google sheets?|worksheet)\b/i, toolkits: ['GOOGLESHEETS', 'AIRTABLE'] },
     ];
     const connected = new Set(connectedToolkits);
     const matches = [];
@@ -774,7 +788,7 @@ class ToolRouter {
     const systemPrompt = `Select the connected SwiftCollab apps needed for this work request.
 Connected app toolkits: ${JSON.stringify(connected)}
 Return JSON only: {"toolkits":["EXACT_TOOLKIT_NAME"]}
-Choose only connected names. Usually choose 1-3 apps. Include multiple apps only when the request transfers data or performs actions across them.`;
+Choose only connected names. Include EVERY app needed for every requested action; a single request may legitimately use 10 or more apps. Do not discard later actions merely because earlier ones use a different app.`;
 
     try {
       const response = await this.callGemini(systemPrompt, message, 0);
@@ -841,6 +855,10 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
 
   _deterministicToolSelection(message, availableTools) {
     const text = String(message || '');
+    // Fast paths are intentionally single-action only. Mixed requests must go
+    // through the planner so one calendar phrase cannot swallow email, Jira,
+    // spreadsheet, CRM, or any other actions in the same prompt.
+    if (this._isMultiActionRequest(text, availableTools)) return null;
     const isReminderRequest = /\b(remind|reminder|set|schedule|add|create)\b/i.test(text) &&
       /\b(tomorrow|today|tonight|calendar|meeting|event|remind|reminder|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i.test(text);
     if (!isReminderRequest) return null;
@@ -863,6 +881,25 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
       chatResponse: null,
       deterministic: true,
     };
+  }
+
+  _isMultiActionRequest(message, availableTools = []) {
+    const text = String(message || '').trim();
+    if (!text) return false;
+
+    const connectedToolkits = [...new Set((availableTools || [])
+      .map(tool => String(tool?.toolkit || this._inferToolkit?.(tool?.name) || '').toUpperCase())
+      .filter(toolkit => toolkit && toolkit !== 'SYSTEM' && toolkit !== 'UNKNOWN'))];
+    const explicitApps = connectedToolkits.filter(toolkit =>
+      this._toolkitBrandTerms(toolkit).some(term => term && text.toLowerCase().includes(term))
+    );
+    if (explicitApps.length > 1) return true;
+
+    const actionVerb = /\b(send|email|schedule|create|add|update|edit|assign|search|find|list|fetch|get|post|share|notify|upload|download|delete|remove|move|copy|append|comment|call)\b/gi;
+    const verbs = text.match(actionVerb) || [];
+    if (verbs.length >= 2 && /(?:,|;|\band\b|\bthen\b|\balso\b|\bafter\b)/i.test(text)) return true;
+
+    return /\b(and\s+also|then\s+(?:send|create|update|post|add|schedule)|after\s+that)\b/i.test(text);
   }
 
   async _validateConnections({ selectedTools, entityId, context = {} }) {
@@ -1613,7 +1650,10 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
     }
 
     // Extract time from message
-    const timeExtracted = this._extractTimeFromMessage(message);
+    const timeExtracted = this._extractTimeFromMessage(
+      message,
+      context.userTimeZone || context.timezone || this.USER_TIMEZONE
+    );
     if (timeExtracted) {
       if (!result.autoFilled.start_datetime) {
         result.autoFilled.start_datetime = timeExtracted.start;
@@ -1848,11 +1888,11 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
   // TIME EXTRACTION
   // ===========================================================================
 
-  _extractTimeFromMessage(message) {
+  _extractTimeFromMessage(message, timeZone = this.USER_TIMEZONE) {
     if (!message) return null;
 
     const now = new Date();
-    const offset = this._getOffsetForTimeZone(now, this.USER_TIMEZONE);
+    const offset = this._getOffsetForTimeZone(now, timeZone);
 
     const time12Match = message.match(/(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
     const time24Match = message.match(/(?:at\s+)?(\d{1,2}):(\d{2})(?!\s*[ap]m)/i);
@@ -1875,7 +1915,7 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
     }
 
     // Get the current date in user's timezone to determine the correct calendar date
-    const userDate = this._getDateInTimezone(now, this.USER_TIMEZONE);
+    const userDate = this._getDateInTimezone(now, timeZone);
     const msgLower = message.toLowerCase();
 
     const datePatterns = { today: 0, tonight: 0, tomorrow: 1, tmrw: 1 };
@@ -2369,7 +2409,8 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
   // ===========================================================================
 
   async _stageA_selectTools({ message, availableTools, context }) {
-    const now = this._nowContext();
+    const timeZone = context?.userTimeZone || context?.timezone || this.USER_TIMEZONE;
+    const now = this._nowContext(timeZone);
     const shortlist = availableTools
       .filter(tool => !tool.name.includes('JQL') && !tool.name.includes('_JQL_'))
       .map(tool => ({ name: tool.name, description: tool.description, toolkit: tool.toolkit }));
@@ -2377,7 +2418,7 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
     const hasJiraUpdate = shortlist.some(tool => tool.name === 'JIRA_UPDATE_ISSUE');
     const hasIssueKey = /\b[A-Z][A-Z0-9_]*-\d+\b/i.test(String(message || ''));
     const isAssignment = /\bassign(?:ed|ment)?\b/i.test(String(message || ''));
-    if (hasJiraUpdate && hasIssueKey && isAssignment) {
+    if (hasJiraUpdate && hasIssueKey && isAssignment && !this._isMultiActionRequest(message, availableTools)) {
       return {
         selectedTools: [{ name: 'JIRA_UPDATE_ISSUE', sequence: 1, usePreviousOutput: false }],
         chatResponse: null,
@@ -2386,11 +2427,11 @@ Choose only connected names. Usually choose 1-3 apps. Include multiple apps only
 
     const systemPrompt = `You route SwiftCollab work requests to connected-app tools.
 
-Time: ${now.nowRfc3339} (${this.USER_TIMEZONE})
+Time: ${now.nowRfc3339} (${timeZone})
 Available tools:
 ${JSON.stringify(shortlist)}
 
-Choose only exact names from the list. Include every step needed for the request. Use the same sequence for independent parallel steps and increasing sequences for dependent steps. Set usePreviousOutput=true when a later step consumes earlier results. If none matches, select chat_response. Return JSON only:
+Choose only exact names from the list. Identify every distinct requested action, even when the actions belong to 10 or more different apps. Never stop planning after the first matched action. Use the same sequence for independent parallel steps and increasing sequences for dependent steps. Set usePreviousOutput=true when a later step consumes earlier results. If none matches, select chat_response. Return JSON only:
 {"selectedTools":[{"name":"EXACT_NAME","sequence":1,"usePreviousOutput":false}],"chatResponse":null}`;
 
     const response = await this.callGemini(systemPrompt, message, 0);
@@ -2411,7 +2452,8 @@ Choose only exact names from the list. Include every step needed for the request
   }
 
   async _stageA_selectToolsLegacy({ message, availableTools, context }) {
-    const now = this._nowContext();
+    const timeZone = context?.userTimeZone || context?.timezone || this.USER_TIMEZONE;
+    const now = this._nowContext(timeZone);
 
     // Filter out JQL-based Jira actions - they require complex query syntax users don't know
     const filteredTools = availableTools.filter((t) => {
@@ -2430,7 +2472,7 @@ Choose only exact names from the list. Include every step needed for the request
     const systemPrompt = `You are a tool router. Select the best tool action(s) for the user's request.
 
 CURRENT TIME:
-- timezone: ${this.USER_TIMEZONE}
+- timezone: ${timeZone}
 - now_rfc3339: ${now.nowRfc3339}
 - today: ${now.today}
 - tomorrow: ${now.tomorrow}
@@ -2623,14 +2665,15 @@ OUTPUT JSON:
   }
 
   async _stageA_repairInvalidTools({ message, availableTools, context, invalidTools = [] }) {
-    const now = this._nowContext();
+    const timeZone = context?.userTimeZone || context?.timezone || this.USER_TIMEZONE;
+    const now = this._nowContext(timeZone);
     const allowed = availableTools.map((t) => t.name);
 
     const systemPrompt = `You previously selected invalid tool names: ${invalidTools.join(", ")}.
 Repair the selection by choosing ONLY from this allowed tool list.
 
 CURRENT TIME:
-- timezone: ${this.USER_TIMEZONE}
+- timezone: ${timeZone}
 - now_rfc3339: ${now.nowRfc3339}
 - today: ${now.today}
 - tomorrow: ${now.tomorrow}
@@ -2685,7 +2728,8 @@ OUTPUT JSON:
   }
 
   async _stageB_extractParams({ message, selectedSchemas, context, stageA }) {
-    const now = this._nowContext();
+    const timeZone = context?.userTimeZone || context?.timezone || this.USER_TIMEZONE;
+    const now = this._nowContext(timeZone);
 
     const schemasForPrompt = [...selectedSchemas.values()].map((t) => ({
       name: t.name,
@@ -2702,7 +2746,7 @@ OUTPUT JSON:
     const systemPrompt = `You extract tool parameters for a productivity assistant.
 
 CURRENT TIME:
-- timezone: ${this.USER_TIMEZONE}
+- timezone: ${timeZone}
 - now_rfc3339: ${now.nowRfc3339}
 - today: ${now.today}
 - tomorrow: ${now.tomorrow}
@@ -2745,6 +2789,11 @@ CRITICAL - DO NOT INVENT PARAMETER VALUES:
 - Example: "search all jira issues" → do NOT set jql (returns all), do NOT set assignee, do NOT invent filters
 - Example: "search my assigned issues" → set assignee filter only
 - NEVER invent example values like "PROJ-123", "currentUser()", or "status = 'Done'"
+
+GENERATED CONTENT (PROVIDER-NEUTRAL):
+- When the user explicitly asks SwiftCollab to write, draft, compose, summarize, or generate content, generate it now for semantic content fields such as subject, body, text, message, description, comment, content, notes, title, summary, or row values.
+- Follow the user's requested tone, facts, audience, and word/character length. If the user gives an exact length, generate that exact length. A request for a warm 200-word welcome email therefore needs a generated subject and 200-word body; it is not a missing-value question.
+- Content generation does NOT permit inventing recipients, account IDs, project keys, issue keys, dates, permissions, or other external identifiers.
 
 REFERENCE RESOLUTION:
 - If user says "the same", "same person", "with them", resolve to the value mentioned earlier in the SAME message.
@@ -3188,10 +3237,13 @@ OUTPUT JSON ONLY:
       const schema = schemaTool?.parameters;
 
       const out = {
+        id: t.id || `t${i + 1}`,
         name: t.name,
         params: t.params || {},
         composio_action: schemaTool?.composio_action || t.name,
         sequence: t.sequence || i + 1,
+        dependsOn: Array.isArray(t.dependsOn) ? [...new Set(t.dependsOn)] : [],
+        usePreviousOutput: !!t.usePreviousOutput,
       };
 
       if (!schema) return out;
@@ -3354,16 +3406,16 @@ OUTPUT JSON ONLY:
     return parts.length ? parts.join("\n") : "(none)";
   }
 
-  _nowContext() {
+  _nowContext(timeZone = this.USER_TIMEZONE) {
     const now = new Date();
-    const today = this._formatDateInTz(now, this.USER_TIMEZONE);
+    const today = this._formatDateInTz(now, timeZone);
     const tomorrowDate = new Date(now.getTime() + 86400000);
     const yesterdayDate = new Date(now.getTime() - 86400000);
 
-    const tomorrow = this._formatDateInTz(tomorrowDate, this.USER_TIMEZONE);
-    const yesterday = this._formatDateInTz(yesterdayDate, this.USER_TIMEZONE);
+    const tomorrow = this._formatDateInTz(tomorrowDate, timeZone);
+    const yesterday = this._formatDateInTz(yesterdayDate, timeZone);
 
-    const offset = this._getOffsetForTimeZone(now, this.USER_TIMEZONE);
+    const offset = this._getOffsetForTimeZone(now, timeZone);
     const nowRfc3339 = `${now.toISOString().replace(".000", "")} (local offset ${offset})`;
 
     return { nowRfc3339, today, tomorrow, yesterday, offset };

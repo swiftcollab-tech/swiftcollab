@@ -44,7 +44,7 @@ class AssistantOrchestrator {
   // Defaults
   // -------------------------
   static DEFAULTS = {
-    userTimeZone: "America/New_York",
+    userTimeZone: "UTC",
 
     // Safety guards
     maxSelectedTools: 50, // router output guard (natural language shouldn't spawn 50 tools)
@@ -103,7 +103,7 @@ class AssistantOrchestrator {
         context.userTimezone ||
         context.timezone ||
         this.config.userTimeZone ||
-        "America/New_York",
+        "UTC",
     };
 
     const sessKey = this._sessKey(sessionId);
@@ -150,7 +150,7 @@ class AssistantOrchestrator {
           type: "execution_result",
           sessionId,
           result,
-          reply: await this._formatExecutionSummary(result),
+          reply: await this._formatExecutionSummary(result, enrichedContext.userTimeZone),
           isResume: true,
         };
       }
@@ -271,7 +271,7 @@ class AssistantOrchestrator {
         context.userTimezone ||
         context.timezone ||
         this.config.userTimeZone ||
-        "America/New_York",
+        "UTC",
     };
 
     return await this._withSessionLock(lockKey, async () => {
@@ -307,7 +307,12 @@ class AssistantOrchestrator {
       sess.lastAction = "PLAN_EXECUTED";
       await this._saveSession(sessKey, sess);
 
-      return { type: "execution_result", sessionId, result, reply: await this._formatExecutionSummary(result) };
+      return {
+        type: "execution_result",
+        sessionId,
+        result,
+        reply: await this._formatExecutionSummary(result, enrichedContext.userTimeZone),
+      };
     });
   }
 
@@ -325,6 +330,7 @@ class AssistantOrchestrator {
     followupContext = null,
     answers = [],
     conversationHistory = [],
+    userTimeZone = null,
     onProgress = null,
   }) {
     // The conversation is the durable orchestration boundary. Reusing its ID
@@ -354,7 +360,7 @@ class AssistantOrchestrator {
           organizationId,
           conversationId,
           conversationHistory,
-          userTimeZone: followupContext?.userTimeZone || "America/New_York",
+          userTimeZone: userTimeZone || followupContext?.userTimeZone || this.config?.userTimeZone || "UTC",
           onProgress,
         },
         resumeToken: followupContext?.resumeToken || null,
@@ -766,7 +772,10 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       return {
         type: "execution_result",
         sessionId: sess.sessionId,
-        reply: await this._formatExecutionSummary(execResult),
+        reply: await this._formatExecutionSummary(
+          execResult,
+          context.userTimeZone || this.config.userTimeZone
+        ),
         result: execResult,
       };
     } catch (err) {
@@ -825,7 +834,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
   // -------------------------
   // Internal: Execution summary (uses AssistantComposer for user-friendly output)
   // -------------------------
-  async _formatExecutionSummary(execResult, timezone = "America/New_York") {
+  async _formatExecutionSummary(execResult, timezone = "UTC") {
     if (!execResult) return "Done.";
 
     // Use Composer for user-friendly formatting
