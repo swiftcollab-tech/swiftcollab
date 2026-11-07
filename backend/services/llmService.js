@@ -134,23 +134,50 @@ function createLLMService(config = {}) {
       }
     }
 
-    const response = await fetch(`${compatibleBaseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${compatibleApiKey}`,
-      },
-      body: JSON.stringify(requestBody),
-      signal: createTimeoutSignal(timeoutMs),
-    });
+    const maxAttempts = temperature === 0 ? 3 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const attemptBody = { ...requestBody };
+      if (attempt > 1) {
+        attemptBody.messages = messages.map((message, index) => {
+          if (index !== 0 || message.role !== 'system') return message;
+          return {
+            ...message,
+            content: `${message.content}\n\nRETRY REQUIREMENT: Return exactly one syntactically valid JSON object. Do not use markdown, tool-call tags, comments, or any text outside the JSON object.`,
+          };
+        });
+      }
 
-    if (!response.ok) {
+      const response = await fetch(`${compatibleBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${compatibleApiKey}`,
+        },
+        body: JSON.stringify(attemptBody),
+        signal: createTimeoutSignal(timeoutMs),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || '';
+      }
+
       const detail = await response.text();
-      throw new Error(`Hosted LLM API error: ${response.status} - ${detail}`);
+      const isJsonValidationFailure =
+        response.status === 400 &&
+        /json_validate_failed|failed to validate json|failed_generation/i.test(detail);
+      if (isJsonValidationFailure && attempt < maxAttempts) {
+        console.warn(`[LLM] Hosted provider JSON validation failed; retrying (${attempt}/${maxAttempts})`);
+        await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+        continue;
+      }
+
+      const error = new Error(`Hosted LLM API error: ${response.status} - ${detail}`);
+      error.status = response.status;
+      throw error;
     }
 
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || '';
+    throw new Error('Hosted LLM API failed after JSON validation retries');
   }
 
   async function complete(systemPrompt = '', userPrompt = '', temperature = 0.1) {

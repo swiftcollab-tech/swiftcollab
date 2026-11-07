@@ -485,6 +485,52 @@ test('planner reconciliation preserves multiple requested actions in the same ap
   ]));
 });
 
+test('independent multi-app writes never create self or circular dependencies', () => {
+  const router = Object.create(ToolRouter.prototype);
+  const tools = [
+    { id: 'mail', name: 'GMAIL_SEND_EMAIL', sequence: 1, params: { to: 'adeebakishwar@gmail.com', body: 'Welcome' } },
+    { id: 'sheet', name: 'GOOGLESHEETS_CREATE_SPREADSHEET', sequence: 2, params: { title: 'scheduled events' } },
+    { id: 'jira', name: 'JIRA_ADD_COMMENT', sequence: 3, params: { issue_key: 'SCRUM-1', comment: 'Onboarding completed' } },
+    { id: 'calendar', name: 'GOOGLECALENDAR_CREATE_EVENT', sequence: 4, params: { summary: 'Onboarding call' } },
+    { id: 'append', name: 'GOOGLESHEETS_APPEND_VALUES', sequence: 5, params: { values: [['Onboarding call']] } },
+  ];
+  const schemas = new Map([
+    ['GMAIL_SEND_EMAIL', { description: 'Send an email', parameters: { properties: { body: { type: 'string' } }, required: ['body'] } }],
+    ['GOOGLESHEETS_CREATE_SPREADSHEET', { description: 'Create a spreadsheet', parameters: { properties: { title: { type: 'string' } }, required: ['title'] } }],
+    ['JIRA_ADD_COMMENT', { description: 'Add a Jira comment', parameters: { properties: { comment: { type: 'string' } }, required: ['comment'] } }],
+    ['GOOGLECALENDAR_CREATE_EVENT', { description: 'Create a calendar event', parameters: { properties: { description: { type: 'string' } }, required: [] } }],
+    ['GOOGLESHEETS_APPEND_VALUES', {
+      description: 'Append spreadsheet values',
+      parameters: {
+        properties: { spreadsheet_id: { type: 'string' }, values: { type: 'array' } },
+        required: ['spreadsheet_id', 'values'],
+      },
+    }],
+  ]);
+
+  const planned = router._enforceDataDependencies(tools, schemas,
+    'send an onboarding email, schedule a call, create a sheet, and comment on Jira');
+  const append = planned.find(tool => tool.id === 'append');
+
+  assert.ok(append.dependsOn.includes('sheet'));
+  for (const tool of planned) {
+    assert.ok(!(tool.dependsOn || []).includes(tool.id), `${tool.name} depends on itself`);
+  }
+  assert.equal(ExecutorV2.prototype._validateDag(planned).valid, true);
+});
+
+test('an invalid or empty execution is never reported as completed zero of zero', async () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  const message = await orchestrator._formatExecutionSummary({
+    success: false,
+    results: [],
+    error: 'Invalid execution DAG: circular dependency detected',
+  });
+  assert.match(message, /^❌/);
+  assert.match(message, /Invalid execution DAG/);
+  assert.doesNotMatch(message, /Completed \(0\/0 actions\)/);
+});
+
 test('sheet typo follow-ups still enter connected-app routing', () => {
   assert.equal(classifyToolIntent('try again to update the spreed sheet', ['GOOGLESHEETS']).requiresTools, true);
 });

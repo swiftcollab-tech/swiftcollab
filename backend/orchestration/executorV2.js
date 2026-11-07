@@ -627,6 +627,7 @@ class ExecutorV2 {
       results: dag.results,
       stepResults: dag.stepResults,
       summary: dag.summary,
+      error: dag.error || null,
       startTime: startedAt,
       endTime: finishedAt,
       duration: finishedAt - startedAt,

@@ -858,6 +858,15 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
   async _formatExecutionSummary(execResult, timezone = "UTC") {
     if (!execResult) return "Done.";
 
+    const rawResults = Array.isArray(execResult.results) ? execResult.results : [];
+    if (rawResults.length === 0) {
+      const detail = execResult.error || execResult.summary;
+      if (execResult.success === false || detail) {
+        return `❌ ${detail || "No actions were executed."}`;
+      }
+      return "⚠️ No actions were executed.";
+    }
+
     // Use Composer for user-friendly formatting
     try {
       const composed = await this.composer.composeExecutionDeterministic({
@@ -872,7 +881,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
     }
 
     // Fallback to simple format if Composer fails
-    const results = Array.isArray(execResult.results) ? execResult.results : [];
+    const results = rawResults;
     const okCount = results.filter((r) => r && r.success).length;
     const failCount = results.filter((r) => r && !r.success && r.status !== "skipped").length;
 

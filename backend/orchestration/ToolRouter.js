@@ -3286,7 +3286,11 @@ OUTPUT JSON ONLY:
     const isExplicitConsumer = (tool) =>
       !!tool.usePreviousOutput || this._containsInjectMarker(tool.params) || hasInjectToken(tool.params);
 
-    const producerPattern = /\b(list|search|get|fetch|find|lookup|query|read|retrieve|export|create|add|new|generate|insert|sync|import)\b/i;
+    // Generic cross-app data flow must start from an action that actually
+    // returns existing data. CREATE/ADD actions are handled by the explicit
+    // resource dependency block above. Treating writes as generic producers
+    // can make a write depend on itself and create a circular execution DAG.
+    const producerPattern = /\b(list|search|get|fetch|find|lookup|query|read|retrieve|export)\b/i;
     const consumerVerbPattern = /\b(send|email|post|message|notify|share|forward|publish|broadcast|dispatch|slack)\b/i;
 
     // Assign task IDs if not present
@@ -3411,8 +3415,7 @@ OUTPUT JSON ONLY:
 
     // If we have both producers and consumers, set up data flow
     if (producers.length > 0 && consumers.size > 0) {
-      // Get producer IDs for dependency tracking
-      const producerIds = producers.map(p => p.id);
+      const toolIndexById = new Map(sortedTools.map((tool, index) => [tool.id, index]));
 
       const toolsWithDeps = sortedTools.map(tool => {
         if (!consumers.has(tool.id)) return tool;
@@ -3428,14 +3431,23 @@ OUTPUT JSON ONLY:
           currentValue === "__INJECT__" ||
           currentValue === "_inject_from_previous";
 
-        if (needsInjection) {
-          console.log(`[ToolRouter] Auto-detected data dependency: ${producers.map(p => p.name).join(', ')} → ${tool.name}.${contentField}`);
+        // Only consume output from retrieval actions that occur before this
+        // tool. Never add the current tool (or a later tool) as a dependency.
+        const currentIndex = toolIndexById.get(tool.id) ?? Number.MAX_SAFE_INTEGER;
+        const eligibleProducers = producers.filter(producer =>
+          producer.id !== tool.id &&
+          (toolIndexById.get(producer.id) ?? Number.MAX_SAFE_INTEGER) < currentIndex
+        );
+        const producerIds = eligibleProducers.map(producer => producer.id);
+
+        if (needsInjection && producerIds.length > 0) {
+          console.log(`[ToolRouter] Auto-detected data dependency: ${eligibleProducers.map(p => p.name).join(', ')} → ${tool.name}.${contentField}`);
           console.log(`[ToolRouter] Setting dependsOn: [${producerIds.join(', ')}]`);
 
           return {
             ...tool,
             usePreviousOutput: true,
-            dependsOn: [...(tool.dependsOn || []), ...producerIds],
+            dependsOn: [...new Set([...(tool.dependsOn || []), ...producerIds])],
             params: {
               ...tool.params,
               [contentField]: "_inject_from_previous",

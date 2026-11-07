@@ -125,3 +125,39 @@ test('requires JSON-capable OpenRouter endpoints for deterministic orchestration
     '{"selectedTools":[]}'
   );
 });
+
+test('retries transient hosted-provider JSON validation failures', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  let calls = 0;
+
+  global.fetch = async (_url, options) => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => JSON.stringify({
+          error: { code: 'json_validate_failed', message: 'Failed to validate JSON' },
+        }),
+      };
+    }
+
+    const body = JSON.parse(options.body);
+    assert.match(body.messages[0].content, /RETRY REQUIREMENT/);
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '{"tools":[]}' } }] }),
+    };
+  };
+
+  const service = createLLMService({
+    provider: 'openai-compatible',
+    compatibleBaseUrl: 'https://api.groq.com/openai/v1',
+    compatibleApiKey: 'groq-key',
+    compatibleModel: 'openai/gpt-oss-20b',
+  });
+
+  assert.equal(await service.complete('Return JSON only', 'plan this request', 0), '{"tools":[]}');
+  assert.equal(calls, 2);
+});
