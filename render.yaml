@@ -56,6 +56,12 @@ services:
         sync: false
       - key: JIRA_REDIRECT_URI
         value: https://swiftcollab-dev.onrender.com/api/connectors/jira/callback
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://swiftcollab-dev.onrender.com/api/connectors/gmail/callback
 
 databases:
   - name: swiftcollab-dev-db

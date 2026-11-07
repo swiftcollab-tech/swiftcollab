@@ -629,10 +629,16 @@ function App({ initialWorkspace, onWorkspaceChange }) {
         if (status.attemptComplete || (!data.connectionAttemptId && status.connected)) {
           clearInterval(pollInterval);
           if (popup && !popup.closed) popup.close();
-          setConnectionStatus(prev => ({ ...prev, [app.id]: { ...status, connected: true, provider: 'direct' } }));
+          const connectedApps = status.connectionFamily === 'google_workspace'
+            ? ['gmail', 'gcalender', 'drive', 'docs', 'sheets']
+            : [app.id];
+          const familyStatuses = Object.fromEntries(connectedApps.map(appId => [appId, { ...status, connected: true, provider: 'direct' }]));
+          setConnectionStatus(prev => ({ ...prev, ...familyStatuses }));
           setMessages(prev => [...prev, {
             role: 'assistant',
-            text: `Successfully connected ${app.name} through the native SwiftCollab connector.`
+            text: status.connectionFamily === 'google_workspace'
+              ? 'Successfully connected your Google account. Gmail, Calendar, Drive, Docs, and Sheets are now ready.'
+              : `Successfully connected ${app.name} through the native SwiftCollab connector.`
           }]);
         }
       } catch (_error) {

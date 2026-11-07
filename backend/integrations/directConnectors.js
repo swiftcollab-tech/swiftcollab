@@ -3,19 +3,32 @@ const jira = require('../services/jiraConnectorService');
 const { frappeConnectionManager, executeFrappeAction } = require('./frappe');
 
 const googleWorkspaceConnector = {
-  canExecuteActions: false,
+  canExecuteActions: true,
   async initiateConnection({ organizationId, userId }) {
     const result = await googleWorkspace.startConnection({ organizationId, userId });
     return { redirectUrl: result.authorizationUrl, status: 'PENDING' };
   },
-  async getConnectionStatus({ organizationId }) {
-    const result = await googleWorkspace.status(organizationId);
+  async completeConnection({ state, code }) {
+    return googleWorkspace.completeConnection({ state, code });
+  },
+  async getConnectionStatus({ organizationId, userId }) {
+    const result = await googleWorkspace.status(organizationId, userId);
     return { ...result, connected: result.status === 'connected' };
   },
-  // Generic chat actions are not switched to this adapter until their action
-  // schemas have native implementations. Existing interview scheduling uses
-  // googleWorkspaceService directly and remains unchanged.
-  supportsAction() { return false; },
+  async disconnect({ organizationId, userId }) {
+    return googleWorkspace.disconnect(organizationId, userId);
+  },
+  supportsAction(actionName) {
+    return googleWorkspace.supportsAction(actionName);
+  },
+  async executeAction({ actionName, params, organizationId, userId }) {
+    const data = await googleWorkspace.executeAction({ organizationId, userId, actionName, params });
+    return { success: true, successful: true, data, error: null };
+  },
+  getTools({ app } = {}) {
+    const tools = googleWorkspace.getTools();
+    return app?.actionPrefix ? tools.filter(tool => tool.name.startsWith(app.actionPrefix)) : tools;
+  },
 };
 
 const frappeConnector = {

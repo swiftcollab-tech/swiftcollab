@@ -24,12 +24,8 @@ const CONNECTOR_CATALOG = [
   entry('linkedin', 'LinkedIn', 'LINKEDIN', 'social'),
   entry('figma', 'Figma', 'FIGMA', 'design'),
   entry('miro', 'Miro', 'MIRO', 'design'),
-  entry('gcalender', 'Google Calendar', 'GOOGLECALENDAR', 'productivity', {
-    status: 'available',
-    connector: 'google_workspace',
-    authType: 'oauth2',
-  }),
-  entry('gmail', 'Gmail', 'GMAIL', 'productivity'),
+  entry('gcalender', 'Google Calendar', 'GOOGLECALENDAR', 'productivity', googleWorkspace()),
+  entry('gmail', 'Gmail', 'GMAIL', 'productivity', googleWorkspace()),
   entry('slack', 'Slack', 'SLACK', 'productivity'),
   entry('zoom', 'Zoom', 'ZOOM', 'productivity'),
   entry('outlook', 'Outlook', 'OUTLOOK', 'productivity'),
@@ -48,15 +44,21 @@ const CONNECTOR_CATALOG = [
   entry('gitlab', 'GitLab', 'GITLAB', 'developer'),
   entry('bitbucket', 'Bitbucket', 'BITBUCKET', 'developer'),
   entry('confluence', 'Confluence', 'CONFLUENCE', 'developer'),
-  entry('drive', 'Google Drive', 'GOOGLEDRIVE', 'storage'),
-  entry('docs', 'Google Docs', 'GOOGLEDOCS', 'storage'),
-  entry('sheets', 'Google Sheets', 'GOOGLESHEETS', 'storage', {
+  entry('drive', 'Google Drive', 'GOOGLEDRIVE', 'storage', googleWorkspace()),
+  entry('docs', 'Google Docs', 'GOOGLEDOCS', 'storage', googleWorkspace()),
+  entry('sheets', 'Google Sheets', 'GOOGLESHEETS', 'storage', googleWorkspace()),
+  entry('dropbox', 'Dropbox', 'DROPBOX', 'storage'),
+];
+
+function googleWorkspace() {
+  return {
     status: 'available',
     connector: 'google_workspace',
     authType: 'oauth2',
-  }),
-  entry('dropbox', 'Dropbox', 'DROPBOX', 'storage'),
-];
+    connectionScope: 'user',
+    connectionFamily: 'google_workspace',
+  };
+}
 
 function entry(id, name, toolkit, category, direct = {}) {
   return Object.freeze({
@@ -70,6 +72,8 @@ function entry(id, name, toolkit, category, direct = {}) {
         status: direct.status || 'setup_required',
         connector: direct.connector || id,
         authType: direct.authType || 'oauth2',
+        connectionScope: direct.connectionScope || 'organization',
+        connectionFamily: direct.connectionFamily || null,
       },
       composio: { status: 'available', connector: 'composio' },
     },

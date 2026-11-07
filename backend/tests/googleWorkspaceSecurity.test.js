@@ -3,7 +3,7 @@ const assert = require('assert');
 process.env.INTEGRATION_ENCRYPTION_KEY = Buffer.alloc(32, 19).toString('base64');
 
 const { encrypt, decrypt } = require('../services/credentialEncryptionService');
-const { spreadsheetId, parseSheetValues } = require('../services/googleWorkspaceService');
+const { SCOPES, spreadsheetId, parseSheetValues, emailRaw, asRows } = require('../services/googleWorkspaceService');
 
 const value = { refresh_token: 'test-refresh-token', access_token: 'test-access-token' };
 const encrypted = encrypt(value);
@@ -21,5 +21,15 @@ assert.strictEqual(parsed.assignments[0].candidate_name, 'Asha');
 assert.strictEqual(parsed.assignments[0].interviewer_email, 'mentor@example.test');
 assert.strictEqual(parsed.assignments[0].preferred_start, '');
 assert.deepStrictEqual(parsed.warnings, []);
+assert.ok(SCOPES.includes('https://www.googleapis.com/auth/gmail.send'));
+assert.ok(SCOPES.includes('https://www.googleapis.com/auth/calendar.events'));
+assert.ok(SCOPES.includes('https://www.googleapis.com/auth/drive.file'));
+assert.ok(SCOPES.includes('https://www.googleapis.com/auth/documents'));
+assert.ok(SCOPES.includes('https://www.googleapis.com/auth/spreadsheets'));
+assert.deepStrictEqual(asRows(['A', 'B']), [['A', 'B']]);
+assert.deepStrictEqual(asRows('[["A","B"]]'), [['A', 'B']]);
+const rawEmail = Buffer.from(emailRaw({ to: 'person@example.test', subject: 'Hello', body: 'World' }), 'base64url').toString('utf8');
+assert.match(rawEmail, /To: person@example\.test/);
+assert.match(rawEmail, /Subject: Hello/);
 
 console.log('Google Workspace encryption and Sheet ID tests passed');

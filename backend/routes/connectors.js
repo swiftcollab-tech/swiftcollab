@@ -9,9 +9,11 @@ function initConnectorRoutes({ connectorService, authenticateToken }) {
     res.json({ connectors: connectorService.listCatalog() });
   });
 
-  router.post('/:appId/connect', authenticateToken, requireOrganization(['owner', 'admin', 'member']), async (req, res) => {
+  router.post('/:appId/connect', authenticateToken, requireOrganization(), async (req, res) => {
     try {
-      if (req.body?.provider === 'direct' && !['owner', 'admin'].includes(req.organization.role)) {
+      if (req.body?.provider === 'direct'
+        && !connectorService.isUserScopedDirect(req.params.appId)
+        && !['owner', 'admin'].includes(req.organization.role)) {
         return res.status(403).json({ error: 'Only an organization owner or admin can connect a shared native integration' });
       }
       const userId = req.user.userId;
@@ -90,8 +92,11 @@ function initConnectorRoutes({ connectorService, authenticateToken }) {
     }
   });
 
-  router.delete('/:appId/connect/:connectionId', authenticateToken, requireOrganization(['owner', 'admin']), async (req, res) => {
+  router.delete('/:appId/connect/:connectionId', authenticateToken, requireOrganization(), async (req, res) => {
     try {
+      if (!connectorService.isUserScopedDirect(req.params.appId) && !['owner', 'admin'].includes(req.organization.role)) {
+        return res.status(403).json({ error: 'Only an organization owner or admin can disconnect a shared native integration' });
+      }
       await connectorService.disconnect({
         appId: req.params.appId,
         organizationId: req.organization.organization_id,
@@ -104,8 +109,11 @@ function initConnectorRoutes({ connectorService, authenticateToken }) {
     }
   });
 
-  router.delete('/:appId/connect', authenticateToken, requireOrganization(['owner', 'admin']), async (req, res) => {
+  router.delete('/:appId/connect', authenticateToken, requireOrganization(), async (req, res) => {
     try {
+      if (!connectorService.isUserScopedDirect(req.params.appId) && !['owner', 'admin'].includes(req.organization.role)) {
+        return res.status(403).json({ error: 'Only an organization owner or admin can disconnect a shared native integration' });
+      }
       await connectorService.disconnect({
         appId: req.params.appId,
         organizationId: req.organization.organization_id,

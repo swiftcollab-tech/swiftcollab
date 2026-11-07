@@ -43,10 +43,15 @@ class ConnectorService {
     return Boolean(app && this._directAdapter(app)?.canExecuteActions);
   }
 
+  isUserScopedDirect(appIdOrToolkit) {
+    const app = getConnector(appIdOrToolkit);
+    return app?.providers?.direct?.connectionScope === 'user';
+  }
+
   getDirectTools(appIdOrToolkit) {
     const app = getConnector(appIdOrToolkit);
     const adapter = app ? this._directAdapter(app) : null;
-    return adapter?.getTools?.() || [];
+    return adapter?.getTools?.({ app }) || [];
   }
 
   async initiateConnection({ appId, provider, entityId, organizationId, userId, redirectUrl, connectionParams }) {

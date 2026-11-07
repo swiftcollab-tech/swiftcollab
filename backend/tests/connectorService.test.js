@@ -12,6 +12,7 @@ const {
   isCurrentUserAssignee,
 } = require('../services/jiraConnectorService');
 const { ActionRegistry } = require('../orchestration/core/ActionRegistry');
+const googleWorkspace = require('../services/googleWorkspaceService');
 
 test('catalog covers every application currently displayed in SwiftCollab', () => {
   assert.equal(CONNECTOR_CATALOG.length, 33);
@@ -24,6 +25,44 @@ test('catalog covers every application currently displayed in SwiftCollab', () =
   assert.equal(getConnector('gcalender').toolkit, 'GOOGLECALENDAR');
   assert.equal(getConnector('GOOGLECALENDAR').id, 'gcalender');
   assert.equal(connectorForAction('JIRA_CREATE_ISSUE').id, 'jira');
+});
+
+test('all visible Google apps share one personal Google Workspace connection', () => {
+  const googleApps = ['gmail', 'gcalender', 'drive', 'docs', 'sheets'].map(getConnector);
+  for (const app of googleApps) {
+    assert.equal(app.providers.direct.status, 'available');
+    assert.equal(app.providers.direct.connector, 'google_workspace');
+    assert.equal(app.providers.direct.connectionScope, 'user');
+    assert.equal(app.providers.direct.connectionFamily, 'google_workspace');
+  }
+});
+
+test('native Google connector exposes tools for every connected Google app family', () => {
+  const names = new Set(googleWorkspace.getTools().map(tool => tool.name));
+  assert.ok(names.has('GMAIL_SEND_EMAIL'));
+  assert.ok(names.has('GOOGLECALENDAR_CREATE_EVENT'));
+  assert.ok(names.has('GOOGLEDRIVE_SEARCH_FILES'));
+  assert.ok(names.has('GOOGLEDOCS_CREATE_DOCUMENT'));
+  assert.ok(names.has('GOOGLESHEETS_GET_VALUES'));
+  for (const name of names) assert.equal(googleWorkspace.supportsAction(name), true);
+  assert.equal(ActionRegistry.isValidAction('GOOGLEDRIVE_CREATE_FOLDER'), true);
+  assert.equal(ActionRegistry.isValidAction('GOOGLEDOCS_APPEND_TEXT'), true);
+  assert.equal(ActionRegistry.isValidAction('GOOGLESHEETS_UPDATE_VALUES'), true);
+});
+
+test('Google direct connections are user-scoped while Jira remains organization-scoped', () => {
+  const service = new ConnectorService();
+  assert.equal(service.isUserScopedDirect('gmail'), true);
+  assert.equal(service.isUserScopedDirect('GOOGLEDRIVE'), true);
+  assert.equal(service.isUserScopedDirect('jira'), false);
+});
+
+test('Google direct tool schemas stay limited to the selected Google application', () => {
+  const { createDirectConnectors } = require('../integrations/directConnectors');
+  const service = new ConnectorService({ directConnectors: createDirectConnectors() });
+  assert.ok(service.getDirectTools('gmail').every(tool => tool.name.startsWith('GMAIL_')));
+  assert.ok(service.getDirectTools('GOOGLECALENDAR').every(tool => tool.name.startsWith('GOOGLECALENDAR_')));
+  assert.ok(service.getDirectTools('drive').every(tool => tool.name.startsWith('GOOGLEDRIVE_')));
 });
 
 test('Composio remains the connection and execution fallback', async () => {

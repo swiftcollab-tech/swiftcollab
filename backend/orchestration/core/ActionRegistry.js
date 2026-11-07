@@ -864,6 +864,43 @@ const ACTION_ALLOWLIST = {
   },
 };
 
+// Native Google Workspace actions use the same safety policy as Composio
+// actions. Keeping them in the central registry ensures writes are confirmed
+// and read-only operations remain safe for preflight execution.
+const NATIVE_GOOGLE_ACTIONS = {
+  GOOGLEDRIVE_SEARCH_FILES: ['Search Google Drive files', false],
+  GOOGLEDRIVE_GET_FILE: ['Get Google Drive file metadata', false],
+  GOOGLEDRIVE_CREATE_FOLDER: ['Create Google Drive folder', true],
+  GOOGLEDRIVE_CREATE_FILE: ['Create Google Drive file', true],
+  GOOGLEDOCS_CREATE_DOCUMENT: ['Create Google document', true],
+  GOOGLEDOCS_GET_DOCUMENT: ['Read Google document', false],
+  GOOGLEDOCS_APPEND_TEXT: ['Append text to Google document', true],
+  GOOGLESHEETS_CREATE_SPREADSHEET: ['Create Google spreadsheet', true],
+  GOOGLESHEETS_GET_VALUES: ['Read Google Sheet values', false],
+  GOOGLESHEETS_APPEND_VALUES: ['Append Google Sheet values', true],
+  GOOGLESHEETS_UPDATE_VALUES: ['Update Google Sheet values', true],
+};
+
+for (const [action, [name, mutating]] of Object.entries(NATIVE_GOOGLE_ACTIONS)) {
+  ACTION_ALLOWLIST.actions[action] = {
+    enabled: true,
+    provider: 'google_workspace',
+    composio_action: action,
+    category: action.startsWith('GOOGLEDRIVE_') ? 'storage' : 'document',
+    mutating,
+    irreversible: false,
+    description: name,
+    required_scopes: [],
+    user_facing_name: name,
+    examples: [],
+    side_effect_tier: mutating ? SIDE_EFFECT_TIERS.EXPLICIT_WRITE : SIDE_EFFECT_TIERS.PURE_READ,
+    side_effects: mutating ? [{ type: 'google_workspace_change', description: name }] : [],
+    preflight_safe: !mutating,
+    preflight_alternative: null,
+    requires_confirmation: mutating,
+  };
+}
+
 // ============================================
 // COMPONENT 2: VERSIONED ALIAS MAP
 // Handle deprecated or renamed actions safely
