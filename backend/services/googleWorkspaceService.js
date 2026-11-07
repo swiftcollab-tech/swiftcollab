@@ -165,6 +165,25 @@ function spreadsheetId(value) {
   return match ? match[1] : normalized;
 }
 
+function normalizeSheetRange(value, fallback = 'Sheet1!A1') {
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  if (/^first\s+column$/i.test(raw)) return 'Sheet1!A:A';
+  const ordinal = raw.match(/^(first|second|third|fourth|fifth)\s+column$/i);
+  if (ordinal) {
+    const letters = { first: 'A', second: 'B', third: 'C', fourth: 'D', fifth: 'E' };
+    const column = letters[ordinal[1].toLowerCase()];
+    return `Sheet1!${column}:${column}`;
+  }
+  const namedColumn = raw.match(/^(?:the\s+)?column\s+([A-Z]+)$/i);
+  if (namedColumn) {
+    const column = namedColumn[1].toUpperCase();
+    return `Sheet1!${column}:${column}`;
+  }
+  if (/^[A-Z]+(?::[A-Z]+)?$/i.test(raw)) return `Sheet1!${raw.toUpperCase()}`;
+  return raw;
+}
+
 const COLUMN_ALIASES = {
   candidate_name: ['candidate name', 'student name', 'applicant name', 'name'],
   candidate_email: ['candidate email', 'student email', 'applicant email', 'email'],
@@ -445,7 +464,7 @@ async function executeAction({ organizationId, userId, actionName, params = {} }
     return (await sheets.spreadsheets.create({ requestBody: { properties: { title } } })).data;
   }
   const id = spreadsheetId(first(params, 'spreadsheet_id', 'spreadsheetId', 'spreadsheet'));
-  const range = first(params, 'range') || 'Sheet1';
+  const range = normalizeSheetRange(first(params, 'range'), action === 'GOOGLESHEETS_APPEND_VALUES' ? 'Sheet1!A1' : 'Sheet1');
   if (!id) throw new Error('Google Sheets action requires spreadsheet_id');
   if (action === 'GOOGLESHEETS_GET_VALUES') return (await sheets.spreadsheets.values.get({ spreadsheetId: id, range })).data;
   const values = asRows(params.values);
@@ -488,5 +507,5 @@ function getTools() {
 module.exports = {
   SCOPES, SUPPORTED_ACTIONS, startConnection, completeConnection, status, authenticatedClient, disconnect,
   executeAction, supportsAction, getTools, readSheet, readAssignments, getBusyIntervals, createInterviewEvent,
-  updateInterviewEvent, spreadsheetId, parseSheetValues, emailRaw, asRows,
+  updateInterviewEvent, spreadsheetId, normalizeSheetRange, parseSheetValues, emailRaw, asRows,
 };

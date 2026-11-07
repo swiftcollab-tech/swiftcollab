@@ -392,6 +392,17 @@ class ToolRouter {
     const stageA = this._deterministicToolSelection(message, availableTools) ||
       await this._stageA_selectTools({ message, availableTools, context });
 
+    // The model is a planner, but it is not the source of truth for whether an
+    // explicitly requested action exists. Smaller hosted models occasionally
+    // return only the first action in a long request. Reconcile the plan with
+    // high-confidence action clauses before schemas are selected so later
+    // stages cannot silently lose Calendar, Sheets, Jira, or any other app.
+    stageA.selectedTools = this._ensureRequestedActionsCovered(
+      message,
+      stageA.selectedTools,
+      availableTools
+    );
+
     // Chat-only response
     if (stageA.selectedTools.length === 1 && stageA.selectedTools[0].name === "chat_response") {
       return {
@@ -689,7 +700,7 @@ class ToolRouter {
   _toolkitSearchTerms(toolkit) {
     const normalized = String(toolkit || '').toUpperCase();
     const aliases = {
-      GOOGLECALENDAR: ['google calendar', 'calendar', 'meeting', 'event', 'reminder'],
+      GOOGLECALENDAR: ['google calendar', 'google callender', 'calendar', 'callender', 'meeting', 'call', 'event', 'reminder'],
       GMAIL: ['gmail', 'email', 'mail'],
       OUTLOOK: ['outlook', 'email', 'calendar', 'meeting'],
       GITHUB: ['github', 'repository', 'repo', 'pull request', 'commit'],
@@ -706,7 +717,7 @@ class ToolRouter {
       NOTION: ['notion', 'page', 'database', 'document'],
       GOOGLEDRIVE: ['google drive', 'drive', 'file', 'document'],
       GOOGLEDOCS: ['google docs', 'document'],
-      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet', 'worksheet'],
+      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet', 'spread sheet', 'spreed sheet', 'worksheet', 'workbook'],
       DROPBOX: ['dropbox', 'file'],
       HUBSPOT: ['hubspot', 'contact', 'deal', 'company'],
       SALESFORCE: ['salesforce', 'lead', 'contact', 'opportunity', 'account'],
@@ -720,7 +731,7 @@ class ToolRouter {
   _toolkitBrandTerms(toolkit) {
     const normalized = String(toolkit || '').toUpperCase();
     const brands = {
-      GOOGLECALENDAR: ['google calendar'],
+      GOOGLECALENDAR: ['google calendar', 'google callender'],
       GMAIL: ['gmail'],
       OUTLOOK: ['outlook'],
       GITHUB: ['github'],
@@ -737,7 +748,7 @@ class ToolRouter {
       NOTION: ['notion'],
       GOOGLEDRIVE: ['google drive'],
       GOOGLEDOCS: ['google docs'],
-      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet'],
+      GOOGLESHEETS: ['google sheets', 'google sheet', 'spreadsheet', 'spread sheet', 'spreed sheet'],
       DROPBOX: ['dropbox'],
       HUBSPOT: ['hubspot'],
       SALESFORCE: ['salesforce'],
@@ -751,11 +762,11 @@ class ToolRouter {
   _uniqueCapabilityMatches(message, connectedToolkits) {
     const groups = [
       { pattern: /\b(email|mail|send an? email)\b/i, toolkits: ['GMAIL', 'OUTLOOK', 'SENDGRID'] },
-      { pattern: /\b(calendar|schedule|meeting|event|remind|reminder)\b/i, toolkits: ['GOOGLECALENDAR', 'OUTLOOK', 'ZOOM'] },
+      { pattern: /\b(calendar|callender|schedule|meeting|call|event|remind|reminder)\b/i, toolkits: ['GOOGLECALENDAR', 'OUTLOOK', 'ZOOM'] },
       { pattern: /\b(repository|repo|pull request|merge request|commit)\b/i, toolkits: ['GITHUB', 'GITLAB', 'BITBUCKET'] },
       { pattern: /\b(channel|chat message|notify the team)\b/i, toolkits: ['SLACK', 'MICROSOFTTEAMS', 'DISCORD'] },
       { pattern: /\b(file|document|folder)\b/i, toolkits: ['GOOGLEDRIVE', 'GOOGLEDOCS', 'DROPBOX', 'NOTION'] },
-      { pattern: /\b(spreadsheet|google sheets?|worksheet)\b/i, toolkits: ['GOOGLESHEETS', 'AIRTABLE'] },
+      { pattern: /\b(spread\s*sheet|spreed\s*sheet|google sheets?|worksheet|workbook)\b/i, toolkits: ['GOOGLESHEETS', 'AIRTABLE'] },
     ];
     const connected = new Set(connectedToolkits);
     const matches = [];
@@ -881,6 +892,151 @@ Choose only connected names. Include EVERY app needed for every requested action
       chatResponse: null,
       deterministic: true,
     };
+  }
+
+  _ensureRequestedActionsCovered(message, selectedTools, availableTools) {
+    const text = String(message || '');
+    if (!text || !Array.isArray(availableTools) || availableTools.length === 0) {
+      return selectedTools || [];
+    }
+
+    const selected = [...(selectedTools || [])];
+    const selectedNames = new Set(selected.map(tool => tool.name));
+    const coveredNames = new Set();
+    const relevantToolkitsSeen = new Set();
+    const coveredByToolkit = new Map();
+    const readRequestedByToolkit = new Set();
+    const toolkits = [...new Set(availableTools.map(tool => tool.toolkit).filter(Boolean))];
+    const clauses = text
+      .split(/\s*(?:,\s*and\b|;|\band\s+also\b|\band\s+(?=(?:send|schedule|create|add|append|update|edit|delete|remove|post|comment|write)\b))\s*/i)
+      .map(clause => clause.trim())
+      .filter(Boolean);
+
+    const addBestMatch = (clause, toolkit, intent, preferredSequence = 1) => {
+      const mutationIntent = ['send', 'create', 'schedule', 'append', 'update', 'comment', 'delete'].includes(intent);
+      const intentTokens = {
+        send: ['send', 'email', 'message'],
+        schedule: ['create', 'event', 'schedule'],
+        create: ['create', 'new', 'add'],
+        append: ['append', 'add', 'values', 'rows', 'write'],
+        update: ['update', 'edit', 'change'],
+        comment: ['comment', 'add', 'post'],
+        delete: ['delete', 'remove'],
+        read: ['get', 'list', 'search', 'find', 'read', 'fetch'],
+      }[intent] || [intent];
+
+      const ranked = availableTools
+        .filter(tool => tool.toolkit === toolkit && tool.name !== 'chat_response')
+        .map(tool => {
+          const name = String(tool.name || '').toLowerCase().replaceAll('_', ' ');
+          const description = String(tool.description || '').toLowerCase();
+          let score = 0;
+          for (const token of intentTokens) {
+            if (name.includes(token)) score += 5;
+            else if (description.includes(token)) score += 2;
+          }
+          if (mutationIntent && /\b(list|search|find|get|fetch|read)\b/.test(name)) score -= 8;
+          if (intent === 'comment' && !/comment/.test(`${name} ${description}`)) score -= 10;
+          if (intent === 'schedule' && !/event|calendar|meeting|schedule/.test(`${name} ${description}`)) score -= 10;
+          if (intent === 'send' && !/send|email|message/.test(`${name} ${description}`)) score -= 10;
+          if (intent === 'append' && !/append|add.*value|insert.*row|write/.test(`${name} ${description}`)) score -= 8;
+          if (intent === 'create' && !/create|new/.test(`${name} ${description}`)) score -= 8;
+          return { tool, score };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      const best = ranked[0];
+      if (!best || best.score < 4) return;
+      coveredNames.add(best.tool.name);
+      if (!coveredByToolkit.has(toolkit)) coveredByToolkit.set(toolkit, new Set());
+      coveredByToolkit.get(toolkit).add(best.tool.name);
+      if (selectedNames.has(best.tool.name)) return;
+      selected.push({
+        name: best.tool.name,
+        sequence: preferredSequence,
+        usePreviousOutput: false,
+      });
+      selectedNames.add(best.tool.name);
+      console.log(`[ToolRouter] Restored omitted ${intent} action from request: ${best.tool.name}`);
+    };
+
+    for (const clause of clauses) {
+      const clauseLower = clause.toLowerCase();
+      const explicitToolkits = toolkits.filter(toolkit =>
+        this._toolkitSearchTerms(toolkit).some(term => term && clauseLower.includes(term))
+      );
+      const capabilityToolkits = this._uniqueCapabilityMatches(clause, toolkits);
+      const relevant = [...new Set([...explicitToolkits, ...capabilityToolkits])];
+      relevant.forEach(toolkit => relevantToolkitsSeen.add(toolkit));
+
+      for (const toolkit of relevant) {
+        const upperToolkit = String(toolkit).toUpperCase();
+        const isSheet = /SHEET|AIRTABLE/.test(upperToolkit) || /sheet|spreadsheet|worksheet/.test(clauseLower);
+        const namedResource = /\b(named|naming|called|titled)\b/.test(clauseLower);
+
+        if (/\b(send|email)\b/.test(clauseLower) && /GMAIL|OUTLOOK|SENDGRID/.test(upperToolkit)) {
+          addBestMatch(clause, toolkit, 'send');
+        }
+        if (/\b(schedule|calendar|meeting|call|event)\b/.test(clauseLower) && /CALENDAR|OUTLOOK|ZOOM/.test(upperToolkit)) {
+          addBestMatch(clause, toolkit, 'schedule');
+        }
+        if (/\bcomment\b/.test(clauseLower)) {
+          addBestMatch(clause, toolkit, 'comment');
+        }
+        if (isSheet && namedResource) {
+          addBestMatch(clause, toolkit, 'create', 1);
+          if (/\b(update|append|add|write|record|information|details|data)\b/.test(clauseLower)) {
+            addBestMatch(clause, toolkit, 'append', 2);
+          }
+        }
+        if (/\b(list|show|find|search|get|read|fetch)\b/.test(clauseLower)) {
+          readRequestedByToolkit.add(toolkit);
+          addBestMatch(clause, toolkit, 'read');
+        }
+
+        const hasSpecializedMutation =
+          (/\b(send|email)\b/.test(clauseLower) && /GMAIL|OUTLOOK|SENDGRID/.test(upperToolkit)) ||
+          (/\b(schedule|calendar|meeting|call|event)\b/.test(clauseLower) && /CALENDAR|OUTLOOK|ZOOM/.test(upperToolkit)) ||
+          /\bcomment\b/.test(clauseLower) ||
+          (isSheet && namedResource);
+        if (!hasSpecializedMutation) {
+          if (/\b(create|new|add)\b/.test(clauseLower)) addBestMatch(clause, toolkit, 'create');
+          else if (/\b(update|edit|change)\b/.test(clauseLower)) addBestMatch(clause, toolkit, 'update');
+          else if (/\b(delete|remove)\b/.test(clauseLower)) addBestMatch(clause, toolkit, 'delete');
+        }
+      }
+    }
+
+    const reconciled = selected.filter(tool => {
+      if (tool.name === 'chat_response') return coveredNames.size === 0;
+      const schema = availableTools.find(candidate => candidate.name === tool.name);
+      const toolkit = schema?.toolkit;
+      if (!toolkit) return true;
+
+      // When a clause clearly names an app and mutation, reject a different
+      // action from that same app (for example GET_VALUES for "update sheet").
+      const expectedForToolkit = coveredByToolkit.get(toolkit);
+      if (expectedForToolkit?.size && !expectedForToolkit.has(tool.name)) {
+        const actionText = `${tool.name} ${schema.description || ''}`.toLowerCase().replaceAll('_', ' ');
+        const isReadAction = /\b(list|search|find|get|fetch|read)\b/.test(actionText);
+        if (isReadAction && readRequestedByToolkit.has(toolkit)) return true;
+        console.warn(`[ToolRouter] Removed unrelated model action for ${toolkit}: ${tool.name}`);
+        return false;
+      }
+
+      // Reject unrelated mutation tools hallucinated for an app the request
+      // never mentioned. Read/search producers are retained because they may
+      // legitimately supply data to a requested delivery action.
+      const actionText = `${tool.name} ${schema.description || ''}`.toLowerCase().replaceAll('_', ' ');
+      const isMutation = /\b(create|add|append|update|edit|delete|remove|send|post|comment|schedule)\b/.test(actionText);
+      if (isMutation && relevantToolkitsSeen.size > 0 && !relevantToolkitsSeen.has(toolkit) && !coveredNames.has(tool.name)) {
+        console.warn(`[ToolRouter] Removed unrequested model action: ${tool.name}`);
+        return false;
+      }
+      return true;
+    });
+
+    return reconciled.sort((a, b) => (a.sequence || 1) - (b.sequence || 1));
   }
 
   _isMultiActionRequest(message, availableTools = []) {
@@ -1922,6 +2078,8 @@ Choose only connected names. Include EVERY app needed for every requested action
   _extractTimeFromMessage(message, timeZone = this.USER_TIMEZONE) {
     if (!message) return null;
 
+    timeZone = this._timeZoneFromMessage(message, timeZone);
+
     const now = new Date();
     const offset = this._getOffsetForTimeZone(now, timeZone);
 
@@ -2049,7 +2207,21 @@ Choose only connected names. Include EVERY app needed for every requested action
       start: formatDateTime(finalYear, finalMonth, finalDay, hours, minutes),
       end: formatDateTime(endYear, endMonth, endDay, endHours, endMinutes),
       durationMinutes,
+      timezone: timeZone,
     };
+  }
+
+  _timeZoneFromMessage(message, fallback = this.USER_TIMEZONE) {
+    const text = String(message || '');
+    const zones = [
+      [/\bIST\b/i, 'Asia/Kolkata'],
+      [/\b(?:UTC|GMT)\b/i, 'UTC'],
+      [/\b(?:PST|PDT)\b/i, 'America/Los_Angeles'],
+      [/\b(?:MST|MDT)\b/i, 'America/Denver'],
+      [/\b(?:CST|CDT)\b/i, 'America/Chicago'],
+      [/\b(?:EST|EDT)\b/i, 'America/New_York'],
+    ];
+    return zones.find(([pattern]) => pattern.test(text))?.[1] || fallback;
   }
 
   /**
@@ -2965,13 +3137,14 @@ OUTPUT JSON ONLY:
     const assignsToCurrentUser = /\bassign(?:ed|ment)?\b[\s\S]*\b(?:to\s+me|me)\b/i.test(String(message || ''));
     if (resolvedIssueKey) {
       tools = tools.map((tool) => {
-        if (tool.name !== 'JIRA_UPDATE_ISSUE') return tool;
+        const properties = selectedSchemas.get(tool.name)?.parameters?.properties || {};
+        if (!properties.issue_key) return tool;
         return {
           ...tool,
           params: {
             ...tool.params,
             issue_key: resolvedIssueKey,
-            ...(assignsToCurrentUser ? { assignee: 'me' } : {}),
+            ...(assignsToCurrentUser && properties.assignee ? { assignee: 'me' } : {}),
           },
         };
       });

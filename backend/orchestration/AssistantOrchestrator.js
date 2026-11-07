@@ -170,6 +170,14 @@ class AssistantOrchestrator {
         return out;
       }
 
+      // Resume only the failed portion when the user gives a plain retry
+      // command. A message containing changed details is routed as a new plan.
+      if (sess.retryExecution?.tools?.length && this._isPureRetryRequest(userText)) {
+        const out = await this._executeToolChainNow(sess, sess.retryExecution.tools, enrichedContext);
+        await this._saveSession(sessKey, sess);
+        return out;
+      }
+
       // 3) Fresh message → route
       const intent = classifyToolIntent(
         userText,
@@ -236,6 +244,7 @@ class AssistantOrchestrator {
 
       // 4) Start slot filling using router output
       const slotSessionId = `sf_${sessionId}_${Date.now()}`;
+      sess.retryExecution = null;
       await this.slotFiller.startSession(slotSessionId, routing, {
         ...enrichedContext,
         originalMessage: userText,
@@ -765,6 +774,17 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
         onProgress,
       });
 
+      const failedActions = new Set((execResult.results || [])
+        .filter(result => result && !result.success)
+        .map(result => result.action)
+        .filter(Boolean));
+      const failedTools = tools.filter(tool =>
+        failedActions.has(tool.composio_action || tool.action || tool.name)
+      );
+      sess.retryExecution = failedTools.length > 0
+        ? { tools: failedTools, failedAt: Date.now() }
+        : null;
+
       sess.mode = "IDLE";
       sess.lastAction = "EXECUTED";
       await this._endSlotSessionIfAny(sess);
@@ -781,6 +801,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
     } catch (err) {
       sess.mode = "IDLE";
       sess.lastAction = "EXECUTION_FAILED";
+      sess.retryExecution = { tools, failedAt: Date.now() };
       await this._endSlotSessionIfAny(sess);
 
       return { type: "error", sessionId: sess.sessionId, reply: `Execution failed: ${err.message}` };
@@ -889,6 +910,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
           mode: parsed.mode || "IDLE",
           slotSessionId: parsed.slotSessionId || null,
           pendingExecution: parsed.pendingExecution || null,
+          retryExecution: parsed.retryExecution || null,
           lastAction: parsed.lastAction || null,
           progressChannel: parsed.progressChannel || this._defaultProgressChannel(sessionId),
           createdAt: parsed.createdAt || Date.now(),
@@ -904,6 +926,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       mode: "IDLE",
       slotSessionId: null,
       pendingExecution: null,
+      retryExecution: null,
       lastAction: null,
       progressChannel: this._defaultProgressChannel(sessionId),
       createdAt: Date.now(),
@@ -917,6 +940,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       mode: sess.mode,
       slotSessionId: sess.slotSessionId,
       pendingExecution: sess.pendingExecution,
+      retryExecution: sess.retryExecution,
       lastAction: sess.lastAction,
       progressChannel: sess.progressChannel,
       createdAt: sess.createdAt,
@@ -1010,6 +1034,11 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
   _isNo(text) {
     const s = String(text || "").trim().toLowerCase();
     return /^(no|n|nope|nah|don't|do not|stop|cancel)$/i.test(s);
+  }
+
+  _isPureRetryRequest(text) {
+    const value = String(text || '').trim().toLowerCase();
+    return /^(?:please\s+)?(?:try\s+again|retry|retry\s+it|run\s+it\s+again|do\s+it\s+again)(?:\s*[,.-]?\s*(?:i|we)\s+(?:changed?|fixed?|updated?)\s+(?:the\s+)?(?:permission|access|connection))?[.!\s]*$/i.test(value);
   }
 
   _executorSupportsResume() {

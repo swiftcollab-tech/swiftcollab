@@ -1414,8 +1414,9 @@ class ExecutorV2 {
         rawResult = { successful: !!exec.success, data: exec.data, error: exec.error };
       }
     } catch (err) {
+      const friendlyError = this._friendlyConnectorError(actionName, err);
       console.error(`[ExecutorV2] ${actionName} failed:`, err.message);
-      rawResult = { successful: false, data: null, error: err.message };
+      rawResult = { successful: false, data: null, error: friendlyError };
     }
 
     // 5) Normalize result
@@ -1710,6 +1711,17 @@ class ExecutorV2 {
     }
 
     return out;
+  }
+
+  _friendlyConnectorError(actionName, error) {
+    const message = String(error?.message || error || 'Connector action failed');
+    if (/^GOOGLE/i.test(String(actionName || '')) && /insufficient permission|insufficient authentication scopes|access token.*scope/i.test(message)) {
+      return 'Google has not granted SwiftCollab the required permission for this action. Reconnect your Google account in SwiftCollab and approve the requested Google Sheets, Calendar, Gmail, and Drive permissions.';
+    }
+    if (/^GOOGLE/i.test(String(actionName || '')) && /caller does not have permission|permission denied|forbidden/i.test(message)) {
+      return 'The connected Google account cannot access this file. Share it with the same Google account connected to SwiftCollab, then retry.';
+    }
+    return message;
   }
 
   _findInjectionValue(payload, targetParam, requestedPath = []) {

@@ -423,6 +423,72 @@ test('the normal action planner never exposes the internal connection check tool
   assert.deepEqual(result.selectedTools.map(tool => tool.name), ['GMAIL_SEND_EMAIL']);
 });
 
+test('planner completeness restores every explicit action omitted by a small model', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
+  router._uniqueCapabilityMatches = ToolRouter.prototype._uniqueCapabilityMatches;
+  const tools = [
+    { name: 'GMAIL_SEND_EMAIL', description: 'Send an email', toolkit: 'GMAIL' },
+    { name: 'GOOGLECALENDAR_CREATE_EVENT', description: 'Create a calendar event', toolkit: 'GOOGLECALENDAR' },
+    { name: 'GOOGLESHEETS_CREATE_SPREADSHEET', description: 'Create a spreadsheet', toolkit: 'GOOGLESHEETS' },
+    { name: 'GOOGLESHEETS_APPEND_VALUES', description: 'Append rows of values', toolkit: 'GOOGLESHEETS' },
+    { name: 'JIRA_ADD_COMMENT', description: 'Add a comment to an issue', toolkit: 'JIRA' },
+    { name: 'JIRA_SEARCH_ISSUES', description: 'Search issues', toolkit: 'JIRA' },
+  ];
+  const result = router._ensureRequestedActionsCovered(
+    'send a onboarding email to bhemaraju.138@gmail.com and , schedule a call in google callender at tomorrow at 14 pm ist and update the above information in a google sheet naming it as scheduled events , and also update the comment in the SCRUM-1 jira with the above task done as information',
+    [{ name: 'GMAIL_SEND_EMAIL', sequence: 1, usePreviousOutput: false }],
+    tools
+  );
+  assert.deepEqual(new Set(result.map(tool => tool.name)), new Set([
+    'GMAIL_SEND_EMAIL',
+    'GOOGLECALENDAR_CREATE_EVENT',
+    'GOOGLESHEETS_CREATE_SPREADSHEET',
+    'GOOGLESHEETS_APPEND_VALUES',
+    'JIRA_ADD_COMMENT',
+  ]));
+});
+
+test('planner reconciliation removes unrelated actions when the user requested a sheet update', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
+  router._uniqueCapabilityMatches = ToolRouter.prototype._uniqueCapabilityMatches;
+  const tools = [
+    { name: 'GOOGLESHEETS_GET_VALUES', description: 'Read values', toolkit: 'GOOGLESHEETS' },
+    { name: 'GOOGLESHEETS_UPDATE_VALUES', description: 'Update cells', toolkit: 'GOOGLESHEETS' },
+    { name: 'GOOGLEDRIVE_CREATE_FILE', description: 'Create a file', toolkit: 'GOOGLEDRIVE' },
+  ];
+  const result = router._ensureRequestedActionsCovered(
+    'try again to update the spreadsheet',
+    [{ name: 'GOOGLESHEETS_GET_VALUES', sequence: 1 }, { name: 'GOOGLEDRIVE_CREATE_FILE', sequence: 1 }],
+    tools
+  );
+  assert.deepEqual(result.map(tool => tool.name), ['GOOGLESHEETS_UPDATE_VALUES']);
+});
+
+test('planner reconciliation preserves multiple requested actions in the same app', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
+  router._uniqueCapabilityMatches = ToolRouter.prototype._uniqueCapabilityMatches;
+  const tools = [
+    { name: 'JIRA_SEARCH_ISSUES', description: 'Search Jira issues', toolkit: 'JIRA' },
+    { name: 'JIRA_ADD_COMMENT', description: 'Add a comment to a Jira issue', toolkit: 'JIRA' },
+  ];
+  const result = router._ensureRequestedActionsCovered(
+    'search Jira for SCRUM-1 and comment on Jira issue SCRUM-1 that onboarding is complete',
+    [{ name: 'JIRA_SEARCH_ISSUES', sequence: 1 }],
+    tools
+  );
+  assert.deepEqual(new Set(result.map(tool => tool.name)), new Set([
+    'JIRA_SEARCH_ISSUES',
+    'JIRA_ADD_COMMENT',
+  ]));
+});
+
+test('sheet typo follow-ups still enter connected-app routing', () => {
+  assert.equal(classifyToolIntent('try again to update the spreed sheet', ['GOOGLESHEETS']).requiresTools, true);
+});
+
 test('preflight time overrides stay scoped to the calendar action', async () => {
   const router = Object.create(ToolRouter.prototype);
   router.USER_TIMEZONE = 'UTC';
@@ -450,6 +516,17 @@ test('preflight time overrides stay scoped to the calendar action', async () => 
   assert.match(merged[0].params.start, /14:00:00\+05:30$/);
   assert.equal(merged[1].params.start, undefined);
   assert.equal(merged[1].params.end, undefined);
+});
+
+test('an explicit IST timezone overrides a UTC client fallback', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'UTC';
+  router._timeZoneFromMessage = ToolRouter.prototype._timeZoneFromMessage;
+  router._getOffsetForTimeZone = ToolRouter.prototype._getOffsetForTimeZone;
+  router._getDateInTimezone = ToolRouter.prototype._getDateInTimezone;
+  const value = router._extractTimeFromMessage('tomorrow at 14:00 IST', 'UTC');
+  assert.equal(value.timezone, 'Asia/Kolkata');
+  assert.match(value.start, /14:00:00\+05:30$/);
 });
 
 test('a created resource is injected into a later action requiring its id', () => {
@@ -485,6 +562,21 @@ test('executor finds a created resource id inside provider response envelopes', 
     executor._findInjectionValue({ data: { result: { spreadsheetId: 'sheet-123' } } }, 'spreadsheet_id', ['spreadsheetId']),
     'sheet-123'
   );
+});
+
+test('Google scope failures produce a reconnect instruction', () => {
+  const executor = new ExecutorV2({ composio: {}, query: null });
+  assert.match(
+    executor._friendlyConnectorError('GOOGLESHEETS_UPDATE_VALUES', new Error('Insufficient Permission')),
+    /Reconnect your Google account/i
+  );
+});
+
+test('plain retry commands are distinguished from changed requests', () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  assert.equal(orchestrator._isPureRetryRequest('try again'), true);
+  assert.equal(orchestrator._isPureRetryRequest('try again, I changed the permission'), true);
+  assert.equal(orchestrator._isPureRetryRequest('try again to update the spreadsheet'), false);
 });
 
 test('slot filling preserves the exact routed provider schema', async () => {
@@ -557,6 +649,34 @@ test('parameter planning allows requested content generation without inventing i
   });
   assert.equal(result.tools[0].params.to, 'new.user@example.com');
   assert.match(result.tools[0].params.body, /Welcome/);
+});
+
+test('explicit Jira keys are preserved for comment actions even when the model omits them', async () => {
+  const router = Object.create(ToolRouter.prototype);
+  router.USER_TIMEZONE = 'Asia/Kolkata';
+  router._parseJson = ToolRouter.prototype._parseJson;
+  router._formatContextForPrompt = () => '';
+  router._nowContext = ToolRouter.prototype._nowContext;
+  router._inferToolkit = ToolRouter.prototype._inferToolkit;
+  router.callGemini = async () => JSON.stringify({
+    tools: [{ name: 'JIRA_ADD_COMMENT', sequence: 1, params: { comment: 'Onboarding completed' } }],
+  });
+  const selectedSchemas = new Map([['JIRA_ADD_COMMENT', {
+    name: 'JIRA_ADD_COMMENT',
+    toolkit: 'JIRA',
+    parameters: {
+      type: 'object',
+      properties: { issue_key: { type: 'string' }, comment: { type: 'string' } },
+      required: ['issue_key', 'comment'],
+    },
+  }]]);
+  const result = await router._stageB_extractParams({
+    message: 'Add a comment to SCRUM -1 that onboarding is completed',
+    selectedSchemas,
+    stageA: { selectedTools: [{ name: 'JIRA_ADD_COMMENT', sequence: 1 }] },
+    context: {},
+  });
+  assert.equal(result.tools[0].params.issue_key, 'SCRUM-1');
 });
 
 test('confirmation and execution summaries never hide later actions', async () => {
