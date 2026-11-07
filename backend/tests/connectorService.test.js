@@ -13,6 +13,7 @@ const {
 } = require('../services/jiraConnectorService');
 const { ActionRegistry } = require('../orchestration/core/ActionRegistry');
 const googleWorkspace = require('../services/googleWorkspaceService');
+const { ComposioService } = require('../composioService');
 
 test('catalog covers every application currently displayed in SwiftCollab', () => {
   assert.equal(CONNECTOR_CATALOG.length, 33);
@@ -194,4 +195,33 @@ test('connector service forwards Jira connection attempt and resource identifier
   assert.equal(calls[1][1].connectionId, 'pending_1');
   assert.equal(calls[2][1].connectionId, 'connection_2');
   assert.equal(calls[3][1].connectionId, 'connection_1');
+});
+
+test('Composio disconnect only deletes accounts returned for the authenticated entity and toolkit', async () => {
+  const deleted = [];
+  const service = Object.create(ComposioService.prototype);
+  service.entityId = 'default';
+  service._cache = {
+    connectedApps: new Map([['user_1', { data: [], timestamp: Date.now() }]]),
+    appActions: new Map(),
+    actionSchemas: new Map(),
+    allActions: new Map([['user_1', { data: [], timestamp: Date.now() }]]),
+    availableToolkits: null,
+  };
+  service.composio = {
+    connectedAccounts: {
+      list: async params => {
+        assert.deepEqual(params.userIds, ['user_1']);
+        assert.deepEqual(params.toolkitSlugs, ['slack']);
+        return { items: [{ id: 'conn_1' }, { id: 'conn_2' }] };
+      },
+      delete: async id => { deleted.push(id); },
+    },
+  };
+
+  const result = await service.disconnectToolkit('slack', 'user_1');
+  assert.deepEqual(deleted, ['conn_1', 'conn_2']);
+  assert.equal(result.disconnected, 2);
+  assert.equal(service._cache.connectedApps.has('user_1'), false);
+  assert.equal(service._cache.allActions.has('user_1'), false);
 });

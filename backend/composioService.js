@@ -1062,6 +1062,26 @@ Please provide a brief, friendly summary of what was done.`,
   }
 
   /**
+   * Disconnect every active account for one toolkit owned by this user entity.
+   * Listing with both toolkit and user filters prevents one user from deleting
+   * another user's Composio account even if a connection id is guessed.
+   */
+  async disconnectToolkit(appIdOrToolkit, entityId = null) {
+    const effectiveEntityId = entityId || this.entityId;
+    const toolkit = APP_TO_COMPOSIO_TOOLKIT[appIdOrToolkit]
+      || String(appIdOrToolkit || '').toUpperCase();
+    if (!toolkit) throw new Error('Toolkit is required to disconnect an account');
+
+    const accounts = await this.listConnectedAccounts([toolkit], effectiveEntityId);
+    const connectionIds = (accounts?.items || []).map(account => account.id).filter(Boolean);
+    for (const connectionId of connectionIds) {
+      await this.composio.connectedAccounts.delete(connectionId);
+    }
+    this.clearEntityCache(effectiveEntityId);
+    return { disconnected: connectionIds.length, connectionIds, toolkit };
+  }
+
+  /**
    * Normalize parameters for Composio actions
    * Converts legacy/alias parameter names to canonical Composio names
    */

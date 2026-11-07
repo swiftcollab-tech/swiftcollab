@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, CheckCircle, AlertCircle, Link } from 'lucide-react';
+import { X, CheckCircle, AlertCircle, Link, Unlink } from 'lucide-react';
 
-const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConnect, canManageConnections = false }) => {
+const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConnect, onDisconnect, canManageConnections = false }) => {
     const [isOver, setIsOver] = useState(false);
 
     const handleDragOver = (e) => {
@@ -26,6 +26,11 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
             // Pass authUrl if available, or null if app needs config (has error)
             onConnect(app, status?.authUrl || null);
         }
+    };
+
+    const handleDisconnect = (e, app) => {
+        e.stopPropagation();
+        if (onDisconnect) onDisconnect(app);
     };
 
     const borderColor = isOver
@@ -63,6 +68,8 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                 const isChecking = status === undefined;
                                 const requiresCustomModal = status?.requiresCustomModal; // Custom integration (like Frappe)
                                 const canManageConnection = canManageConnections && isConnected && app.id === 'jira' && status?.provider === 'direct';
+                                const canDisconnectConnection = isConnected
+                                    && (app.id !== 'jira' || status?.provider !== 'direct' || canManageConnections);
 
                                 return (
                                     <motion.div
@@ -109,15 +116,30 @@ const DropZone = ({ title, apps, onDrop, onRemove, connectionStatus = {}, onConn
                                             </button>
                                         )}
 
-                                        {canManageConnection && (
-                                            <button
-                                                onClick={(e) => handleConnect(e, app)}
-                                                className="absolute bottom-1 left-1 right-1 py-1 px-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium rounded-lg flex items-center justify-center gap-1 transition-colors shadow-lg z-20"
-                                                title="Manage connected Jira sites"
-                                            >
-                                                <Link className="w-3 h-3" />
-                                                Manage sites
-                                            </button>
+                                        {(canManageConnection || canDisconnectConnection) && (
+                                            <div className="absolute bottom-1 left-1 right-1 flex gap-1 z-20">
+                                                {canManageConnection && (
+                                                    <button
+                                                        onClick={(e) => handleConnect(e, app)}
+                                                        className="min-w-0 flex-1 py-1 px-1 bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-medium rounded-lg flex items-center justify-center gap-1 transition-colors shadow-lg"
+                                                        title="Manage connected Jira sites"
+                                                    >
+                                                        <Link className="w-3 h-3" />
+                                                        Manage
+                                                    </button>
+                                                )}
+                                                {canDisconnectConnection && (
+                                                    <button
+                                                        onClick={(e) => handleDisconnect(e, app)}
+                                                        disabled={status?.disconnecting}
+                                                        className="min-w-0 flex-1 py-1 px-1 bg-red-600 hover:bg-red-500 text-white text-[10px] font-medium rounded-lg flex items-center justify-center gap-1 transition-colors shadow-lg disabled:opacity-60"
+                                                        title={`Disconnect ${app.name}`}
+                                                    >
+                                                        <Unlink className="w-3 h-3" />
+                                                        {status?.disconnecting ? 'Wait…' : 'Disconnect'}
+                                                    </button>
+                                                )}
+                                            </div>
                                         )}
 
                                         {/* Remove button on hover */}

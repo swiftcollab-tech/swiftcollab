@@ -161,3 +161,73 @@ test('retries transient hosted-provider JSON validation failures', async (t) => 
   assert.equal(await service.complete('Return JSON only', 'plan this request', 0), '{"tools":[]}');
   assert.equal(calls, 2);
 });
+
+test('waits and retries short Groq token-per-minute limits', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  let calls = 0;
+
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 429,
+        headers: { get: () => null },
+        text: async () => JSON.stringify({
+          error: {
+            message: 'Rate limit reached for model on tokens per minute (TPM). Please try again in 0.001s.',
+            type: 'tokens',
+            code: 'rate_limit_exceeded',
+          },
+        }),
+      };
+    }
+
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '{"tools":[]}' } }] }),
+    };
+  };
+
+  const service = createLLMService({
+    provider: 'openai-compatible',
+    compatibleBaseUrl: 'https://api.groq.com/openai/v1',
+    compatibleApiKey: 'groq-key',
+    compatibleModel: 'openai/gpt-oss-20b',
+  });
+
+  assert.equal(await service.complete('Return JSON only', 'plan this request', 0), '{"tools":[]}');
+  assert.equal(calls, 2);
+});
+
+test('does not retry non-transient hosted-provider quota limits', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  let calls = 0;
+
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 429,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        error: { message: 'Daily quota exhausted', type: 'quota' },
+      }),
+    };
+  };
+
+  const service = createLLMService({
+    provider: 'openai-compatible',
+    compatibleBaseUrl: 'https://api.groq.com/openai/v1',
+    compatibleApiKey: 'groq-key',
+    compatibleModel: 'openai/gpt-oss-20b',
+  });
+
+  await assert.rejects(
+    service.complete('Return JSON only', 'plan this request', 0),
+    /Hosted LLM API error: 429/
+  );
+  assert.equal(calls, 1);
+});

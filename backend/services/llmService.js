@@ -21,6 +21,32 @@ function createTimeoutSignal(timeoutMs) {
   return controller.signal;
 }
 
+function getHeader(response, name) {
+  if (!response?.headers || typeof response.headers.get !== 'function') return '';
+  return String(response.headers.get(name) || '').trim();
+}
+
+function parseShortRateLimitDelayMs(response, detail, maxWaitMs) {
+  if (response?.status !== 429) return null;
+
+  const text = String(detail || '');
+  const isTokenWindowLimit =
+    /tokens per minute|\bTPM\b|"type"\s*:\s*"tokens"/i.test(text);
+  if (!isTokenWindowLimit) return null;
+
+  const retryAfter = getHeader(response, 'retry-after');
+  let delayMs = Number(retryAfter) * 1000;
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    const match = text.match(/try again in\s+([0-9.]+)\s*(ms|s(?:ec(?:ond)?s?)?)/i);
+    if (match) {
+      delayMs = Number(match[1]) * (/^ms$/i.test(match[2]) ? 1 : 1000);
+    }
+  }
+
+  if (!Number.isFinite(delayMs) || delayMs <= 0 || delayMs > maxWaitMs) return null;
+  return Math.ceil(delayMs) + 250;
+}
+
 function createLLMService(config = {}) {
   const provider = String(config.provider || process.env.LLM_PROVIDER || 'openai').trim().toLowerCase();
   const openAIKey = normalizeApiKey(config.openAIKey ?? process.env.OPENAI_API_KEY);
@@ -33,6 +59,9 @@ function createLLMService(config = {}) {
   const compatibleApiKey = normalizeApiKey(config.compatibleApiKey ?? process.env.LLM_API_KEY);
   const compatibleModel = config.compatibleModel || process.env.LLM_MODEL || '';
   const timeoutMs = Number(config.timeoutMs || process.env.LLM_TIMEOUT_MS || 120000);
+  const rateLimitMaxWaitMs = Number(
+    config.rateLimitMaxWaitMs || process.env.LLM_RATE_LIMIT_MAX_WAIT_MS || 30000
+  );
 
   if (!['openai', 'ollama', 'openai-compatible'].includes(provider)) {
     throw new Error(`Unsupported LLM_PROVIDER "${provider}". Use "openai", "ollama", or "openai-compatible".`);
@@ -134,7 +163,7 @@ function createLLMService(config = {}) {
       }
     }
 
-    const maxAttempts = temperature === 0 ? 3 : 1;
+    const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const attemptBody = { ...requestBody };
       if (attempt > 1) {
@@ -163,6 +192,19 @@ function createLLMService(config = {}) {
       }
 
       const detail = await response.text();
+      const rateLimitDelayMs = parseShortRateLimitDelayMs(
+        response,
+        detail,
+        rateLimitMaxWaitMs
+      );
+      if (rateLimitDelayMs !== null && attempt < maxAttempts) {
+        console.warn(
+          `[LLM] Hosted provider token window reached; retrying in ${rateLimitDelayMs}ms (${attempt}/${maxAttempts})`
+        );
+        await new Promise(resolve => setTimeout(resolve, rateLimitDelayMs));
+        continue;
+      }
+
       const isJsonValidationFailure =
         response.status === 400 &&
         /json_validate_failed|failed to validate json|failed_generation/i.test(detail);

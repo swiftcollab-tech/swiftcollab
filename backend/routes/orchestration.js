@@ -614,7 +614,11 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
           const isConnected = accounts?.items?.length > 0;
 
           if (isConnected) {
-            connections[appId] = { connected: true };
+            connections[appId] = {
+              connected: true,
+              provider: 'composio',
+              connectionId: accounts.items[0]?.id || null,
+            };
           } else {
             // Not connected - get auth URL
             try {
@@ -646,6 +650,58 @@ function initOrchestrationRoutes(assistantOrchestrator, authenticateToken, optio
     } catch (error) {
       console.error("[Orchestration] Connection status error:", error);
       return res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Disconnect any connected application through its active provider. Native
+  // personal connectors are user-scoped; shared native connectors still
+  // require an organization owner/admin. Composio accounts are filtered by
+  // the authenticated user's entity before deletion.
+  router.delete('/connections/:appId', authenticateToken, requireOrganization(), async (req, res) => {
+    try {
+      const appId = String(req.params.appId || '').toLowerCase();
+      const userId = req.user.userId;
+      const entityId = `user_${userId}`;
+
+      if (connectorService) {
+        const direct = await connectorService.getDirectStatus({
+          appId,
+          organizationId: req.organization.organization_id,
+          userId,
+        });
+        if (direct.connected) {
+          if (!connectorService.isUserScopedDirect(appId)
+            && !['owner', 'admin'].includes(req.organization.role)) {
+            return res.status(403).json({
+              error: 'Only an organization owner or admin can disconnect a shared native integration',
+            });
+          }
+          await connectorService.disconnect({
+            appId,
+            organizationId: req.organization.organization_id,
+            userId,
+          });
+          return res.json({
+            disconnected: true,
+            provider: 'direct',
+            disconnectedApps: direct.connectedApps || [appId],
+          });
+        }
+      }
+
+      if (!composioService) {
+        return res.status(503).json({ error: 'No integration provider is available' });
+      }
+      const result = await composioService.disconnectToolkit(appId, entityId);
+      return res.json({
+        disconnected: true,
+        provider: 'composio',
+        disconnectedApps: [appId],
+        disconnectedAccounts: result.disconnected,
+      });
+    } catch (error) {
+      console.error('[Connection] Disconnect error:', error);
+      return res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
     }
   });
 

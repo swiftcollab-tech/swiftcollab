@@ -702,6 +702,40 @@ function App({ initialWorkspace, onWorkspaceChange }) {
     }
   };
 
+  const disconnectApp = async (app) => {
+    if (!window.confirm(`Disconnect ${app.name} from SwiftCollab?`)) return;
+    setConnectionStatus(prev => ({
+      ...prev,
+      [app.id]: { ...(prev[app.id] || {}), disconnecting: true },
+    }));
+    try {
+      const result = await apiClient.delete(`/api/connections/${encodeURIComponent(app.id)}`);
+      const disconnectedApps = result.disconnectedApps?.length ? result.disconnectedApps : [app.id];
+      setConnectionStatus(prev => {
+        const next = { ...prev };
+        for (const appId of disconnectedApps) {
+          next[appId] = { connected: false, provider: null, disconnecting: false };
+        }
+        return next;
+      });
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        text: disconnectedApps.length > 1
+          ? `Disconnected your Google account from SwiftCollab. Gmail, Calendar, Drive, Docs, and Sheets are now disconnected.`
+          : `Disconnected ${app.name} from SwiftCollab.`,
+      }]);
+    } catch (error) {
+      setConnectionStatus(prev => ({
+        ...prev,
+        [app.id]: { ...(prev[app.id] || {}), disconnecting: false },
+      }));
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        text: `Unable to disconnect ${app.name}: ${error.message}`,
+      }]);
+    }
+  };
+
   const watchComposioPopup = (app, popup) => {
     const checkInterval = setInterval(async () => {
       try {
@@ -1686,6 +1720,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     onRemove={handleRemoveFromAiOs}
                     connectionStatus={connectionStatus}
                     onConnect={onAppConnect}
+                    onDisconnect={disconnectApp}
                     canManageConnections={['owner', 'admin'].includes(activeOrganization?.role)}
                     color="white"
                   />
@@ -1700,6 +1735,7 @@ function App({ initialWorkspace, onWorkspaceChange }) {
                     onRemove={handleRemoveFromWorkOs}
                     connectionStatus={connectionStatus}
                     onConnect={onAppConnect}
+                    onDisconnect={disconnectApp}
                     canManageConnections={['owner', 'admin'].includes(activeOrganization?.role)}
                     color="white"
                   />
