@@ -506,11 +506,25 @@ async function resolveAssignee(organizationId, siteSelector, assignee, requestin
   return currentUser.accountId;
 }
 
+function selectTransition(transitions, transition) {
+  const wanted = String(transition || '').toLowerCase();
+  let match = transitions.find(item => item.id === String(transition) || item.name?.toLowerCase() === wanted);
+  const terminalIntent = /^(?:closed|done|complete|completed|resolved)$/i.test(wanted);
+  if (!match && terminalIntent) {
+    match = transitions.find(item => item.to?.statusCategory?.key === 'done') ||
+      transitions.find(item => /\b(?:close|closed|done|complete|completed|resolve|resolved)\b/i.test(String(item.name || '')));
+  }
+  return match || null;
+}
+
 async function transitionIssue(organizationId, siteSelector, issueKey, transition, fetchImpl) {
   const available = await jiraRequest({ organizationId, siteSelector, path: `issue/${encodeURIComponent(issueKey)}/transitions`, fetchImpl });
-  const wanted = String(transition || '').toLowerCase();
-  const match = (available?.transitions || []).find(item => item.id === String(transition) || item.name?.toLowerCase() === wanted);
-  if (!match) throw new Error(`Jira transition '${transition}' is not available for ${issueKey}`);
+  const transitions = available?.transitions || [];
+  const match = selectTransition(transitions, transition);
+  if (!match) {
+    const names = transitions.map(item => item.name).filter(Boolean);
+    throw new Error(`Jira transition '${transition}' is not available for ${issueKey}${names.length ? `. Available transitions: ${names.join(', ')}` : ''}`);
+  }
   return jiraRequest({
     organizationId,
     siteSelector,
@@ -732,4 +746,5 @@ module.exports = {
   normalizeIssueKey,
   issueKeyFrom,
   isCurrentUserAssignee,
+  selectTransition,
 };

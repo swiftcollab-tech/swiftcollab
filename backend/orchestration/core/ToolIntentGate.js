@@ -61,7 +61,7 @@ function classifyToolIntent(message, enabledToolkits = [], conversationHistory =
     .map(item => String(item?.text || item?.content || ''))
     .join(' ')
     .toLowerCase();
-  const contextualToolFollowup = /\b(send|share|email|post|show|list|open|close|delete|update|more|all|that|them|it|proceed|continue|retry|again)\b/i.test(text) &&
+  const contextualToolFollowup = /\b(send|share|email|post|show|list|open|close|closed|done|complete|completed|resolved|delete|update|more|all|that|them|it|proceed|continue|retry|again)\b/i.test(text) &&
     (WORK_DATA.test(recentContext) || terms.some(term => term && recentContext.includes(term)));
 
   const requiresTools = connectionRequest ||

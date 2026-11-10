@@ -10,6 +10,7 @@ const {
   normalizeIssueKey,
   issueKeyFrom,
   isCurrentUserAssignee,
+  selectTransition,
 } = require('../services/jiraConnectorService');
 const { ActionRegistry } = require('../orchestration/core/ActionRegistry');
 const googleWorkspace = require('../services/googleWorkspaceService');
@@ -154,6 +155,16 @@ test('Jira issue identifiers and current-user assignment are provider compatible
   assert.equal(isCurrentUserAssignee('account-id-1'), false);
   assert.ok(SCOPES.includes('read:jira-user'));
   assert.equal(ActionRegistry.isValidAction('JIRA_GET_ISSUE'), true);
+});
+
+test('Jira terminal intents resolve to the workflow transition that reaches Done', () => {
+  const transitions = [
+    { id: '11', name: 'Start progress', to: { statusCategory: { key: 'indeterminate' } } },
+    { id: '31', name: 'Finish work', to: { statusCategory: { key: 'done' } } },
+  ];
+  assert.equal(selectTransition(transitions, 'Closed').id, '31');
+  assert.equal(selectTransition(transitions, 'done').id, '31');
+  assert.equal(selectTransition(transitions, '11').id, '11');
 });
 
 test('native Jira tools accept an optional site selector for multi-site organizations', () => {

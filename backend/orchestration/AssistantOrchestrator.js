@@ -172,6 +172,14 @@ class AssistantOrchestrator {
 
       // Resume only the failed portion when the user gives a plain retry
       // command. A message containing changed details is routed as a new plan.
+      const retryOverride = sess.retryExecution?.tools?.length
+        ? this._applyStructuredRetryUpdate(sess.retryExecution.tools, userText)
+        : null;
+      if (retryOverride) {
+        const out = await this._executeToolChainNow(sess, retryOverride, enrichedContext);
+        await this._saveSession(sessKey, sess);
+        return out;
+      }
       if (sess.retryExecution?.tools?.length && this._isPureRetryRequest(userText)) {
         const out = await this._executeToolChainNow(sess, sess.retryExecution.tools, enrichedContext);
         await this._saveSession(sessKey, sess);
@@ -203,7 +211,26 @@ class AssistantOrchestrator {
         };
       }
 
-      const routing = await this.toolRouter.route(userText, enabledToolkits, enrichedContext);
+      const externalInstruction = this._detectExternalInstructionRequest(userText);
+      let routing;
+      if (externalInstruction) {
+        const prepared = await this._prepareExternalInstructionRouting({
+          request: externalInstruction,
+          originalMessage: userText,
+          enabledToolkits,
+          context: enrichedContext,
+        });
+        if (prepared.error) {
+          sess.mode = "IDLE";
+          sess.lastAction = "EXTERNAL_INSTRUCTION_FAILED";
+          await this._saveSession(sessKey, sess);
+          return { type: "error", sessionId, reply: prepared.error };
+        }
+        routing = prepared.routing;
+        sess.dynamicGoal = prepared.goal;
+      } else {
+        routing = await this.toolRouter.route(userText, enabledToolkits, enrichedContext);
+      }
 
       // Inject safe defaults for SYSTEM_* tools (so they can use app/toolkit context)
       this._injectSystemToolDefaults(routing, enabledToolkits, enrichedContext);
@@ -256,7 +283,10 @@ class AssistantOrchestrator {
       sess.lastAction = "SLOT_FILL_STARTED";
 
       const sfRes = await this.slotFiller.process(slotSessionId);
-      const out = await this._handleSlotFillerResult(sess, sfRes, enrichedContext);
+      const out = await this._handleSlotFillerResult(sess, sfRes, {
+        ...enrichedContext,
+        originalMessage: userText,
+      });
 
       await this._saveSession(sessKey, sess);
       return out;
@@ -541,6 +571,7 @@ class AssistantOrchestrator {
     if (action === "CANNOT_COMPLETE") {
       sess.mode = "IDLE";
       sess.lastAction = "CANNOT_COMPLETE";
+      sess.dynamicGoal = null;
       await this._endSlotSessionIfAny(sess);
 
       return {
@@ -555,6 +586,7 @@ class AssistantOrchestrator {
     if (action === "CANCELLED") {
       sess.mode = "IDLE";
       sess.lastAction = "CANCELLED";
+      sess.dynamicGoal = null;
       await this._endSlotSessionIfAny(sess);
       return { type: "cancelled", sessionId: sess.sessionId, reply: "Okay, cancelled." };
     }
@@ -562,6 +594,7 @@ class AssistantOrchestrator {
     if (action === "ERROR") {
       sess.mode = "IDLE";
       sess.lastAction = "ERROR";
+      sess.dynamicGoal = null;
       await this._endSlotSessionIfAny(sess);
       return { type: "error", sessionId: sess.sessionId, reply: sfRes.error || "Something went wrong." };
     }
@@ -659,6 +692,7 @@ class AssistantOrchestrator {
       sess.mode = "IDLE";
       sess.lastAction = "EXECUTION_DECLINED";
       sess.pendingExecution = null;
+      sess.dynamicGoal = null;
       await this._endSlotSessionIfAny(sess);
       return { type: "cancelled", sessionId: sess.sessionId, reply: "Got it - I won't run those actions." };
     }
@@ -676,6 +710,7 @@ class AssistantOrchestrator {
       sess.mode = "IDLE";
       sess.lastAction = "EXECUTION_DECLINED";
       sess.pendingExecution = null;
+      sess.dynamicGoal = null;
       await this._endSlotSessionIfAny(sess);
       return { type: "cancelled", sessionId: sess.sessionId, reply: "Got it - I won't run those actions." };
     }
@@ -782,6 +817,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       sess.retryExecution = failedTools.length > 0
         ? { tools: failedTools, failedAt: Date.now() }
         : null;
+      if (execResult.success !== false) sess.dynamicGoal = null;
 
       sess.mode = "IDLE";
       sess.lastAction = "EXECUTED";
@@ -822,6 +858,207 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       if (failedActions.has(action)) includeWithDependencies(tool);
     }
     return list.filter(tool => included.has(tool));
+  }
+
+  _applyStructuredRetryUpdate(tools, message) {
+    const text = String(message || '').trim();
+    const statusMatch = text.match(/\b(?:as|to|status\s+as|status\s+to)?\s*(closed|done|complete|completed|resolved)\b/i);
+    if (!statusMatch || !/\b(?:do|mark|move|set|change|transition|retry|try)\b/i.test(text)) return null;
+    const target = statusMatch[1].toLowerCase();
+    let changed = false;
+    const updated = (tools || []).map(tool => {
+      const action = String(tool.composio_action || tool.action || tool.name || '').toUpperCase();
+      if (!/^JIRA_(?:TRANSITION|UPDATE)_ISSUE$/.test(action)) return tool;
+      changed = true;
+      return {
+        ...tool,
+        params: {
+          ...(tool.params || {}),
+          ...(action === 'JIRA_TRANSITION_ISSUE' ? { transition: target } : { status: target }),
+        },
+      };
+    });
+    return changed ? updated : null;
+  }
+
+  _detectExternalInstructionRequest(message) {
+    const text = String(message || '');
+    const requestsExecution = /\b(?:perform|execute|complete|carry\s+out|work\s+on|implement|do)\b/i.test(text);
+    const referencesInstructions = /\b(?:description|instructions?|requirements?|acceptance\s+criteria|task|work\s+item|ticket|issue)\b/i.test(text);
+    if (!requestsExecution || !referencesInstructions) return null;
+
+    const jiraKey = text.match(/\b([A-Z][A-Z0-9_]*-\d+)\b/i)?.[1]?.toUpperCase();
+    if (jiraKey) {
+      const terminal = text.match(/\b(?:closed|done|complete|completed|resolved)\b/i)?.[0]?.toLowerCase() || null;
+      return {
+        sourceType: 'jira_issue',
+        sourceTool: 'JIRA_GET_ISSUE',
+        sourceParams: { issue_key: jiraKey },
+        reference: jiraKey,
+        terminalAction: terminal ? {
+          name: 'JIRA_TRANSITION_ISSUE',
+          params: { issue_key: jiraKey, transition: terminal },
+        } : null,
+      };
+    }
+
+    const googleDocId = text.match(/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/i)?.[1];
+    if (googleDocId) {
+      return {
+        sourceType: 'google_document',
+        sourceTool: 'GOOGLEDOCS_GET_DOCUMENT',
+        sourceParams: { document_id: googleDocId },
+        reference: googleDocId,
+        terminalAction: null,
+      };
+    }
+    return null;
+  }
+
+  async _prepareExternalInstructionRouting({ request, originalMessage, enabledToolkits, context }) {
+    const sourceTool = {
+      id: `instruction_source_${crypto.randomUUID()}`,
+      name: request.sourceTool,
+      composio_action: request.sourceTool,
+      sequence: 1,
+      params: request.sourceParams,
+      dependsOn: [],
+    };
+    const sourceResult = await this.executor.executeToolChain({
+      tools: [sourceTool],
+      userId: context.userId,
+      entityId: context.entityId,
+      conversationId: context.conversationId,
+      options: {
+        planId: crypto.randomUUID(),
+        userTimeZone: context.userTimeZone,
+        organizationId: context.organizationId,
+      },
+      onProgress: this._makeProgressPublisher({ sessionId: context.conversationId || 'instruction_source' }, context.onProgress),
+    });
+    if (sourceResult.success === false) {
+      const detail = sourceResult.results?.find(result => !result.success)?.error || sourceResult.error || 'Unable to read the instruction source.';
+      return { error: `I could not read ${request.reference}: ${detail}` };
+    }
+
+    const instructions = this._extractExternalInstructions(sourceResult, request.sourceType);
+    if (!instructions.trim()) {
+      return { error: `I read ${request.reference}, but it does not contain executable instructions or a description.` };
+    }
+
+    const planningMessage = `Perform the work requested in this external work item.\n\n${instructions}`;
+    const routing = await this.toolRouter.route(planningMessage, enabledToolkits, {
+      ...context,
+      externalInstructionSource: {
+        type: request.sourceType,
+        reference: request.reference,
+        originalUserRequest: originalMessage,
+      },
+      conversationHistory: [
+        ...(context.conversationHistory || []),
+        { role: 'user', content: originalMessage },
+        { role: 'system', content: `External work item ${request.reference} was read successfully.` },
+      ],
+    });
+
+    let executable = (routing.tools || []).filter(tool => tool.name !== 'chat_response');
+    // The source item's terminal state is controlled only by the finalizer.
+    // External text cannot move it early and bypass completion dependencies.
+    if (request.terminalAction) {
+      executable = executable
+        .filter(tool => String(tool.composio_action || tool.name || '').toUpperCase() !== 'JIRA_TRANSITION_ISSUE')
+        .map(tool => {
+          const action = String(tool.composio_action || tool.name || '').toUpperCase();
+          if (action !== 'JIRA_UPDATE_ISSUE') return tool;
+          const params = { ...(tool.params || {}) };
+          delete params.status;
+          delete params.transition;
+          return { ...tool, params };
+        });
+    }
+    if (routing.needsConnection) return { error: routing.clarificationQuestion || 'A required application is not connected.' };
+    if (executable.length === 0) {
+      return { error: `I read ${request.reference}, but its description could not be mapped to executable actions in the connected applications. Description: ${instructions.slice(0, 500)}` };
+    }
+
+    if (request.terminalAction) {
+      const ids = executable.map((tool, index) => {
+        if (!tool.id) tool.id = `derived_${index + 1}_${crypto.randomUUID()}`;
+        return tool.id;
+      });
+      const maxSequence = executable.reduce((max, tool) => Math.max(max, tool.sequence || 1), 1);
+      const finalizer = {
+        id: `finalizer_${crypto.randomUUID()}`,
+        name: request.terminalAction.name,
+        composio_action: request.terminalAction.name,
+        sequence: maxSequence + 1,
+        params: request.terminalAction.params,
+        dependsOn: ids,
+      };
+      routing.tools = [...executable, finalizer];
+      routing.schemas = {
+        ...(routing.schemas || {}),
+        JIRA_TRANSITION_ISSUE: {
+          type: 'object',
+          properties: {
+            issue_key: { type: 'string', description: 'Jira issue key' },
+            transition: { type: 'string', description: 'Requested terminal workflow state' },
+          },
+          required: ['issue_key', 'transition'],
+          additionalProperties: false,
+        },
+      };
+    }
+
+    return {
+      routing,
+      goal: {
+        sourceType: request.sourceType,
+        reference: request.reference,
+        originalMessage,
+        instructions,
+        terminalAction: request.terminalAction,
+        status: 'planned',
+        createdAt: Date.now(),
+      },
+    };
+  }
+
+  _extractExternalInstructions(executionResult, sourceType) {
+    const queue = (executionResult?.results || []).map(result => result?.data).filter(Boolean);
+    const seen = new Set();
+    let payload = null;
+    while (queue.length > 0) {
+      const value = queue.shift();
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      if (sourceType === 'jira_issue' && value.fields && typeof value.fields === 'object') {
+        payload = value.fields.description || value.fields.acceptanceCriteria;
+        if (payload) break;
+      }
+      if (sourceType === 'google_document' && value.body?.content) {
+        payload = value.body;
+        break;
+      }
+      for (const nested of Object.values(value)) {
+        if (nested && typeof nested === 'object') queue.push(nested);
+      }
+    }
+    return this._externalContentToText(payload).trim();
+  }
+
+  _externalContentToText(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map(item => this._externalContentToText(item)).filter(Boolean).join('\n');
+    if (typeof value !== 'object') return String(value);
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.content === 'string') return value.content;
+    return Object.entries(value)
+      .filter(([key]) => !['type', 'version', 'attrs', 'marks'].includes(key))
+      .map(([, item]) => this._externalContentToText(item))
+      .filter(Boolean)
+      .join(' ');
   }
 
   // -------------------------
@@ -936,6 +1173,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
           slotSessionId: parsed.slotSessionId || null,
           pendingExecution: parsed.pendingExecution || null,
           retryExecution: parsed.retryExecution || null,
+          dynamicGoal: parsed.dynamicGoal || null,
           lastAction: parsed.lastAction || null,
           progressChannel: parsed.progressChannel || this._defaultProgressChannel(sessionId),
           createdAt: parsed.createdAt || Date.now(),
@@ -952,6 +1190,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       slotSessionId: null,
       pendingExecution: null,
       retryExecution: null,
+      dynamicGoal: null,
       lastAction: null,
       progressChannel: this._defaultProgressChannel(sessionId),
       createdAt: Date.now(),
@@ -966,6 +1205,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       slotSessionId: sess.slotSessionId,
       pendingExecution: sess.pendingExecution,
       retryExecution: sess.retryExecution,
+      dynamicGoal: sess.dynamicGoal,
       lastAction: sess.lastAction,
       progressChannel: sess.progressChannel,
       createdAt: sess.createdAt,

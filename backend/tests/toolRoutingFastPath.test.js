@@ -552,6 +552,83 @@ test('retry context retains the failed action data-source dependency', () => {
   assert.deepEqual(retry.map(tool => tool.id), ['sheet', 'mail']);
 });
 
+test('external Jira work instructions are detected independently of the issue key', () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  const detected = orchestrator._detectExternalInstructionRequest(
+    'Check Jira, perform the task in https://example.atlassian.net/browse/TEAM-42 and then change it to closed'
+  );
+  assert.equal(detected.sourceType, 'jira_issue');
+  assert.equal(detected.sourceParams.issue_key, 'TEAM-42');
+  assert.equal(detected.terminalAction.params.transition, 'closed');
+});
+
+test('external Jira description becomes a derived plan with a dependent finalizer', async () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  orchestrator.executor = {
+    executeToolChain: async ({ tools }) => {
+      assert.equal(tools[0].name, 'JIRA_GET_ISSUE');
+      return {
+        success: true,
+        results: [{
+          success: true,
+          action: 'JIRA_GET_ISSUE',
+          data: {
+            successful: true,
+            data: {
+              key: 'TEAM-42',
+              fields: {
+                description: {
+                  type: 'doc',
+                  version: 1,
+                  content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Send a welcome email to user@example.com' }] }],
+                },
+              },
+            },
+          },
+        }],
+      };
+    },
+  };
+  orchestrator.redis = { publish: async () => 0 };
+  orchestrator.toolRouter = {
+    route: async (message, toolkits, context) => {
+      assert.match(message, /Send a welcome email/);
+      assert.equal(context.externalInstructionSource.reference, 'TEAM-42');
+      return {
+        success: true,
+        tools: [{ id: 'mail', name: 'GMAIL_SEND_EMAIL', composio_action: 'GMAIL_SEND_EMAIL', sequence: 1, params: { to: 'user@example.com', subject: 'Welcome', body: 'Hello' } }],
+        schemas: {},
+      };
+    },
+  };
+  const prepared = await orchestrator._prepareExternalInstructionRouting({
+    request: {
+      sourceType: 'jira_issue',
+      sourceTool: 'JIRA_GET_ISSUE',
+      sourceParams: { issue_key: 'TEAM-42' },
+      reference: 'TEAM-42',
+      terminalAction: { name: 'JIRA_TRANSITION_ISSUE', params: { issue_key: 'TEAM-42', transition: 'closed' } },
+    },
+    originalMessage: 'Perform TEAM-42 and close it',
+    enabledToolkits: ['JIRA', 'GMAIL'],
+    context: { entityId: 'entity', userId: 'user', organizationId: 'org', conversationHistory: [] },
+  });
+  assert.equal(prepared.error, undefined);
+  assert.deepEqual(prepared.routing.tools.map(tool => tool.name), ['GMAIL_SEND_EMAIL', 'JIRA_TRANSITION_ISSUE']);
+  assert.deepEqual(prepared.routing.tools[1].dependsOn, ['mail']);
+});
+
+test('changed Jira terminal-state follow-ups update the failed retry plan', () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  const updated = orchestrator._applyStructuredRetryUpdate([{
+    id: 'finish',
+    name: 'JIRA_TRANSITION_ISSUE',
+    composio_action: 'JIRA_TRANSITION_ISSUE',
+    params: { issue_key: 'TEAM-42', transition: 'closed' },
+  }], 'do it as done');
+  assert.equal(updated[0].params.transition, 'done');
+});
+
 test('planner reconciliation removes unrelated actions when the user requested a sheet update', () => {
   const router = Object.create(ToolRouter.prototype);
   router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
