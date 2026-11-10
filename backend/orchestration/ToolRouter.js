@@ -402,6 +402,11 @@ class ToolRouter {
       stageA.selectedTools,
       availableTools
     );
+    stageA.selectedTools = this._ensureIndirectDataSourcesCovered(
+      message,
+      stageA.selectedTools,
+      availableTools
+    );
 
     // Chat-only response
     if (stageA.selectedTools.length === 1 && stageA.selectedTools[0].name === "chat_response") {
@@ -513,12 +518,17 @@ class ToolRouter {
       context,
       stageA,
     });
+    stageB.tools = this._applyExplicitSourceReferences(stageB.tools, selectedSchemas, message);
 
     // 5) Apply schema-based injection targeting
     const toolsWithInjection = this._applySchemaBasedInjection(stageB.tools, selectedSchemas);
 
     // 5b) Auto-detect and enforce data dependencies for multi-action workflows
-    const toolsWithDependencies = this._enforceDataDependencies(toolsWithInjection, selectedSchemas, message);
+    const toolsWithDependencies = this._planIndirectFanOut(
+      this._enforceDataDependencies(toolsWithInjection, selectedSchemas, message),
+      selectedSchemas,
+      message
+    );
 
     // =========================================================================
     // 6) ENTITY RESOLUTION - Resolve names to emails before preflight
@@ -1037,6 +1047,131 @@ Choose only connected names. Include EVERY app needed for every requested action
     });
 
     return reconciled.sort((a, b) => (a.sequence || 1) - (b.sequence || 1));
+  }
+
+  /**
+   * Restore a missing read step when a destination consumes a collection that
+   * lives in another connected app. This uses capabilities and schemas rather
+   * than a fixed app workflow.
+   */
+  _ensureIndirectDataSourcesCovered(message, selectedTools, availableTools) {
+    const text = String(message || '');
+    const lower = text.toLowerCase();
+    const hasCollectionReference =
+      /\b(?:all|every|each)\b[\s\S]*\b(?:from|in|inside|present in|listed in|contained in)\b/i.test(text) ||
+      /\b(?:emails?|recipients?|contacts?|users?|rows?|records?)\b[\s\S]*\b(?:sheet|spreadsheet|file|table|list|report|document)\b/i.test(text);
+    if (!hasCollectionReference) return selectedTools || [];
+
+    const selected = [...(selectedTools || [])];
+    const selectedNames = new Set(selected.map(tool => tool.name));
+    const hasTypedDestination = selected
+      .map(tool => availableTools.find(candidate => candidate.name === tool.name))
+      .filter(Boolean)
+      .some(tool => Object.keys(tool.parameters?.properties || {})
+        .some(field => /^(?:to|recipient|recipients|recipient_email|attendees|invitees)$/i.test(field)));
+    if (!hasTypedDestination) return selected;
+
+    const mentionedToolkits = new Set((availableTools || [])
+      .map(tool => tool.toolkit)
+      .filter(Boolean)
+      .filter(toolkit => this._toolkitSearchTerms(toolkit).some(term => term && lower.includes(term))));
+    const readPattern = /\b(?:get|read|list|search|fetch|find|query|export)\b/i;
+    const candidates = (availableTools || [])
+      .filter(tool => tool.name !== 'chat_response' && !selectedNames.has(tool.name))
+      .filter(tool => mentionedToolkits.size === 0 || mentionedToolkits.has(tool.toolkit))
+      .map(tool => {
+        const description = `${tool.name || ''} ${tool.description || ''}`.replaceAll('_', ' ').toLowerCase();
+        if (!readPattern.test(description)) return { tool, score: -100 };
+        let score = 4;
+        const properties = tool.parameters?.properties || {};
+        if (Object.keys(properties).some(field => /(?:spreadsheet|file|document|table).*(?:id|url)|^(?:url|file_id|spreadsheet_id)$/i.test(field))) score += 6;
+        for (const token of lower.split(/[^a-z0-9]+/).filter(token => token.length > 3)) {
+          if (description.includes(token)) score += 1;
+        }
+        return { tool, score };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const source = candidates[0]?.tool;
+    if (!source) return selected;
+    selected.push({ name: source.name, sequence: 1, usePreviousOutput: false });
+    console.log(`[ToolRouter] Restored indirect data source for typed destination: ${source.name}`);
+    return selected.sort((a, b) => (a.sequence || 1) - (b.sequence || 1));
+  }
+
+  _applyExplicitSourceReferences(tools, selectedSchemas, message) {
+    const decodedMessage = String(message || '')
+      .replace(/&#x2f;|&#47;/gi, '/')
+      .replace(/&amp;/gi, '&');
+    const urls = decodedMessage.match(/https?:\/\/[^\s<>]+/gi) || [];
+    const spreadsheetUrl = urls.find(url => /docs\.google\.com\/spreadsheets|sheets\.google\.com/i.test(url));
+    if (!spreadsheetUrl) return tools;
+    return (tools || []).map(tool => {
+      const properties = selectedSchemas.get(tool.name)?.parameters?.properties || {};
+      if (!properties.spreadsheet_id) return tool;
+      const params = { ...(tool.params || {}), spreadsheet_id: spreadsheetUrl };
+      if (properties.range && !params.range) params.range = 'A:Z';
+      return { ...tool, params };
+    });
+  }
+
+  /**
+   * Build a typed source -> destination edge. The executor owns extraction,
+   * validation, deduplication, limits and per-item execution.
+   */
+  _planIndirectFanOut(tools, selectedSchemas, message) {
+    if (!Array.isArray(tools) || tools.length < 2) return tools;
+    const collectionIntent = /\b(?:all|every|each)\b|\b(?:emails?|recipients?|contacts?)\b[\s\S]*\b(?:sheet|file|table|list|document)\b/i.test(String(message || ''));
+    if (!collectionIntent) return tools;
+
+    const ordered = [...tools].sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+    const producerPattern = /\b(?:get|read|list|search|fetch|find|query|export)\b/i;
+    const producers = ordered.filter(tool => producerPattern.test(
+      `${tool.name || ''} ${selectedSchemas.get(tool.name)?.description || ''}`.replaceAll('_', ' ')
+    ));
+    if (producers.length === 0) return tools;
+
+    return ordered.map((tool, index) => {
+      const schema = selectedSchemas.get(tool.name)?.parameters;
+      const properties = schema?.properties || {};
+      const required = new Set(schema?.required || []);
+      const targetParam = Object.keys(properties).find(field =>
+        required.has(field) && /^(?:to|recipient|recipients|recipient_email)$/i.test(field)
+      );
+      if (!targetParam) return tool;
+      const source = producers
+        .filter(candidate => candidate.id !== tool.id)
+        .map(candidate => {
+          const schemaTool = selectedSchemas.get(candidate.name);
+          const actionText = `${candidate.name || ''} ${schemaTool?.description || ''}`.replaceAll('_', ' ').toLowerCase();
+          const hasExplicitLocator = Object.entries(candidate.params || {}).some(([field, value]) =>
+            /(?:^|_)(?:url|id)$|spreadsheet|file|document|table/i.test(field) &&
+            typeof value === 'string' && value !== '_inject_from_previous' && value.trim().length > 0
+          );
+          let score = hasExplicitLocator ? 20 : 0;
+          for (const token of String(message || '').toLowerCase().split(/[^a-z0-9]+/).filter(token => token.length > 3)) {
+            if (actionText.includes(token)) score += 1;
+          }
+          if (ordered.indexOf(candidate) < index) score += 2;
+          return { candidate, score };
+        })
+        .sort((a, b) => b.score - a.score)[0]?.candidate;
+      if (!source) return tool;
+      return {
+        ...tool,
+        sequence: Math.max(tool.sequence || 1, (source.sequence || 1) + 1),
+        dependsOn: [...new Set([...(tool.dependsOn || []), source.id])],
+        params: { ...(tool.params || {}), [targetParam]: '_inject_each' },
+        fanOut: {
+          sourceTaskId: source.id,
+          targetParam,
+          valueType: 'email',
+          deduplicate: true,
+          maxItems: 100,
+        },
+      };
+    });
   }
 
   _isMultiActionRequest(message, availableTools = []) {
@@ -2645,7 +2780,14 @@ Time: ${now.nowRfc3339} (${timeZone})
 Available tools:
 ${JSON.stringify(shortlist)}
 
-Choose only exact names from the list. Identify every distinct requested action, even when the actions belong to 10 or more different apps. Never stop planning after the first matched action. Use the same sequence for independent parallel steps and increasing sequences for dependent steps. Set usePreviousOutput=true when a later step consumes earlier results. If none matches, select chat_response. Return JSON only:
+Choose only exact names from the list. Identify every distinct requested action, even when the actions belong to 10 or more different apps. Never stop planning after the first matched action. Use the same sequence for independent parallel steps and increasing sequences for dependent steps. Set usePreviousOutput=true when a later step consumes earlier results.
+
+SOURCE/DESTINATION CONTRACT:
+- If a destination value lives in another app (recipients in a sheet, contacts in a CRM, or issue data in Jira), select BOTH the read/search source tool and the destination tool.
+- A URL, natural-language instruction, or phrase such as "all emails in the sheet" is a DATA REFERENCE, never a recipient, account ID, issue key, or other typed destination value.
+- Plan source -> transformation/validation -> destination. SwiftCollab performs transformation and bounded fan-out deterministically.
+
+If none matches, select chat_response. Return JSON only:
 {"selectedTools":[{"name":"EXACT_NAME","sequence":1,"usePreviousOutput":false}],"chatResponse":null}`;
 
     const response = await this.callGemini(systemPrompt, message, 0);
@@ -3030,6 +3172,7 @@ EMAIL HANDLING:
 - When user provides email addresses in the message, use them EXACTLY as provided
 - For multiple recipients like "send to a@x.com, b@y.com", set to=["a@x.com", "b@y.com"] as an array
 - Extract ALL email addresses from the user message using regex pattern
+- NEVER put a URL or an instruction such as "all emails in this sheet" in to/cc/bcc/recipients. Leave that field null; SwiftCollab binds it to the preceding read action as a typed fan-out.
 
 CHAINING RULES:
 - If a tool has usePreviousOutput=true, you MUST set the content field (body, text, description, message) to "__INJECT__".
@@ -3522,6 +3665,7 @@ OUTPUT JSON ONLY:
         dependsOn: Array.isArray(t.dependsOn) ? [...new Set(t.dependsOn)] : [],
         usePreviousOutput: !!t.usePreviousOutput,
         injectFrom: t.injectFrom && typeof t.injectFrom === 'object' ? { ...t.injectFrom } : null,
+        fanOut: t.fanOut && typeof t.fanOut === 'object' ? { ...t.fanOut } : null,
       };
 
       if (!schema) return out;
@@ -3541,6 +3685,27 @@ OUTPUT JSON ONLY:
       // Required fields check
       console.log(`[ToolRouter] Validating ${out.name}: schema.required=${JSON.stringify(schema?.required)}, params=${JSON.stringify(Object.keys(out.params))}`);
       this._collectMissingRequiredTopLevel(out.name, out.params, schema, missing);
+
+      // The LLM proposes values, but SwiftCollab decides whether typed
+      // destination fields are executable. Indirect values are accepted only
+      // through an explicit, validated fan-out contract.
+      const required = new Set(schema?.required || []);
+      for (const field of Object.keys(schema?.properties || {})) {
+        if (!required.has(field) || !/^(?:to|recipient|recipients|recipient_email)$/i.test(field) || out.fanOut) continue;
+        const raw = out.params?.[field];
+        const values = Array.isArray(raw) ? raw : String(raw || '').split(/[;,]/);
+        const valid = values.filter(Boolean).length > 0 && values.filter(Boolean)
+          .every(value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value).trim()));
+        if (!valid) {
+          missing.push({
+            tool: out.name,
+            field,
+            description: schema?.properties?.[field]?.description || field,
+            type: schema?.properties?.[field]?.type || 'string',
+            reason: 'invalid_typed_recipient',
+          });
+        }
+      }
 
       return out;
     });

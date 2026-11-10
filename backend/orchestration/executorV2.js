@@ -429,7 +429,7 @@ class ExecutorV2 {
     const steps = Array.isArray(plan.steps) ? plan.steps : [];
     const requiresLocalExecution = steps.some((s) =>
       this.isSystemAction(s?.action) || this.isFrappeAction(s?.action) ||
-      s?.provider === 'direct' || String(s?.action || '').startsWith('JIRA_')
+      s?.provider === 'direct' || s?.fanOut || String(s?.action || '').startsWith('JIRA_')
     );
     if (requiresLocalExecution) {
       return this._executeInternal({ plan, userId, entityId, conversationId, options, onProgress, resumeFrom });
@@ -802,6 +802,7 @@ class ExecutorV2 {
         idempotencyKey: s.idempotencyKey || null,
         phase: s.phase || null,
         injectFrom: s.injectFrom || null,
+        fanOut: s.fanOut || null,
         metadata: s.metadata || {},
         sessionId: s.sessionId || null,
       });
@@ -861,6 +862,7 @@ class ExecutorV2 {
         params,
         dependsOn,
         injectFrom: t.injectFrom && typeof t.injectFrom === "object" ? { ...t.injectFrom } : null,
+        fanOut: t.fanOut && typeof t.fanOut === "object" ? { ...t.fanOut } : null,
         // Only assign parallelGroup to tasks that don't depend on previous results
         parallelGroup: hasDepOrNeedsData ? null : groupIdBySequence.get(seq),
         retryConfig: { maxRetries: 3, backoffMs: 1000 },
@@ -1177,7 +1179,99 @@ class ExecutorV2 {
       };
     }
 
+    if (step.fanOut) {
+      return this._executeFanOutStep(step, previousResults, entityId, userId, plan, options);
+    }
+
     return this._executeStepWithRetry(step, previousResults, entityId, userId, plan, options);
+  }
+
+  async _executeFanOutStep(step, previousResults, entityId, userId, plan, options) {
+    const startedAt = Date.now();
+    const spec = step.fanOut || {};
+    const source = previousResults[spec.sourceTaskId];
+    if (!source?.success) {
+      return {
+        stepId: step.id,
+        action: step.action,
+        success: false,
+        status: "failed",
+        error: "The fan-out data source did not complete successfully.",
+        duration: Date.now() - startedAt,
+      };
+    }
+
+    const values = this._extractFanOutValues(unwrapToolPayload(source.data), spec.valueType || "string");
+    const unique = spec.deduplicate === false ? values : [...new Set(values)];
+    const maxItems = Math.max(1, Number(spec.maxItems) || 100);
+    if (unique.length === 0) {
+      return {
+        stepId: step.id,
+        action: step.action,
+        success: false,
+        status: "failed",
+        error: `No valid ${spec.valueType || "values"} were found in the source data.`,
+        duration: Date.now() - startedAt,
+      };
+    }
+    if (unique.length > maxItems) {
+      return {
+        stepId: step.id,
+        action: step.action,
+        success: false,
+        status: "policy_blocked",
+        error: `Resolved ${unique.length} recipients, which exceeds the safe limit of ${maxItems}. Narrow the source or send in smaller batches.`,
+        duration: Date.now() - startedAt,
+      };
+    }
+
+    // Execute separately so recipients are never exposed to one another and
+    // each side effect receives its own semantic idempotency key.
+    const itemResults = [];
+    for (const value of unique) {
+      const child = {
+        ...step,
+        fanOut: null,
+        params: { ...(step.params || {}), [spec.targetParam]: value },
+        idempotencyKey: null,
+      };
+      itemResults.push(await this._executeStepWithRetry(child, previousResults, entityId, userId, plan, options));
+    }
+    const successful = itemResults.filter(result => result.success).length;
+    const failed = itemResults.length - successful;
+    return {
+      stepId: step.id,
+      type: step.type,
+      action: step.action,
+      success: failed === 0,
+      status: failed === 0 ? "success" : "failed",
+      data: { total: itemResults.length, successful, failed, items: itemResults },
+      error: failed ? `${failed} of ${itemResults.length} fan-out actions failed.` : null,
+      duration: Date.now() - startedAt,
+    };
+  }
+
+  _extractFanOutValues(payload, valueType = "string") {
+    const found = [];
+    const seenObjects = new Set();
+    let visited = 0;
+    const visit = value => {
+      if (visited++ > 10000 || value === null || value === undefined) return;
+      if (typeof value === "string") {
+        if (valueType === "email") {
+          found.push(...(value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map(email => email.toLowerCase()));
+        } else if (value.trim()) {
+          found.push(value.trim());
+        }
+        return;
+      }
+      if (typeof value !== "object" || seenObjects.has(value)) return;
+      seenObjects.add(value);
+      if (Array.isArray(value)) value.forEach(visit);
+      else Object.values(value).forEach(visit);
+    };
+    visit(payload);
+    return found;
   }
 
   async _executeStepWithRetry(step, previousResults, entityId, userId, plan, options) {

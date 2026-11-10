@@ -1202,6 +1202,7 @@ ${JSON.stringify(this._buildToolsToExecute(session), null, 2)}
         dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.slice() : [],
         usePreviousOutput: !!t.usePreviousOutput,
         injectFrom: t.injectFrom && typeof t.injectFrom === 'object' ? { ...t.injectFrom } : null,
+        fanOut: t.fanOut && typeof t.fanOut === 'object' ? { ...t.fanOut } : null,
       }));
   }
 
@@ -1230,7 +1231,7 @@ ${JSON.stringify(this._buildToolsToExecute(session), null, 2)}
       const visibleKeys = keys.filter(k => {
         const v = t.params[k];
         if (v === null || v === undefined) return false;
-        if (v === '_inject_from_previous' || v === '__INJECT__') return false;
+        if (v === '_inject_from_previous' || v === '_inject_each' || v === '__INJECT__') return false;
         return true;
       });
 
@@ -1781,6 +1782,9 @@ ${JSON.stringify(this._buildToolsToExecute(session), null, 2)}
         const injectFrom = (!isString && t?.injectFrom && typeof t.injectFrom === 'object')
           ? { ...t.injectFrom }
           : null;
+        const fanOut = (!isString && t?.fanOut && typeof t.fanOut === 'object')
+          ? { ...t.fanOut }
+          : null;
 
         return {
           id: isString ? `tool_${sequence}_${t.trim()}` : (t?.id || `tool_${sequence}_${name}`),
@@ -1791,6 +1795,7 @@ ${JSON.stringify(this._buildToolsToExecute(session), null, 2)}
           dependsOn,
           usePreviousOutput,
           injectFrom,
+          fanOut,
         };
       })
       .filter((t) => t.name);

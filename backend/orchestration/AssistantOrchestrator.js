@@ -778,9 +778,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
         .filter(result => result && !result.success)
         .map(result => result.action)
         .filter(Boolean));
-      const failedTools = tools.filter(tool =>
-        failedActions.has(tool.composio_action || tool.action || tool.name)
-      );
+      const failedTools = this._buildRetryToolClosure(tools, failedActions);
       sess.retryExecution = failedTools.length > 0
         ? { tools: failedTools, failedAt: Date.now() }
         : null;
@@ -806,6 +804,24 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
 
       return { type: "error", sessionId: sess.sessionId, reply: `Execution failed: ${err.message}` };
     }
+  }
+
+  _buildRetryToolClosure(tools, failedActions) {
+    const list = Array.isArray(tools) ? tools : [];
+    const byId = new Map(list.map(tool => [tool.id, tool]).filter(([id]) => id));
+    const included = new Set();
+    const includeWithDependencies = tool => {
+      if (!tool || included.has(tool)) return;
+      for (const dependencyId of tool.dependsOn || []) {
+        includeWithDependencies(byId.get(dependencyId));
+      }
+      included.add(tool);
+    };
+    for (const tool of list) {
+      const action = tool.composio_action || tool.action || tool.name;
+      if (failedActions.has(action)) includeWithDependencies(tool);
+    }
+    return list.filter(tool => included.has(tool));
   }
 
   // -------------------------

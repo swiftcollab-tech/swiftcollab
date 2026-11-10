@@ -449,6 +449,109 @@ test('planner completeness restores every explicit action omitted by a small mod
   ]));
 });
 
+test('indirect recipient data restores a read step and creates typed fan-out', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
+  const available = [
+    {
+      name: 'GMAIL_SEND_EMAIL',
+      description: 'Send an email',
+      toolkit: 'GMAIL',
+      parameters: {
+        properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
+        required: ['to', 'subject', 'body'],
+      },
+    },
+    {
+      name: 'GOOGLESHEETS_GET_VALUES',
+      description: 'Read values from a Google Sheet range',
+      toolkit: 'GOOGLESHEETS',
+      parameters: {
+        properties: { spreadsheet_id: { type: 'string' }, range: { type: 'string' } },
+        required: ['spreadsheet_id', 'range'],
+      },
+    },
+  ];
+  const message = 'send an invitation to all emails present in https://docs.google.com/spreadsheets/d/sheet-123/edit';
+  const selected = router._ensureIndirectDataSourcesCovered(
+    message,
+    [{ name: 'GMAIL_SEND_EMAIL', sequence: 1 }],
+    available
+  );
+  assert.deepEqual(new Set(selected.map(tool => tool.name)), new Set(['GMAIL_SEND_EMAIL', 'GOOGLESHEETS_GET_VALUES']));
+
+  const schemas = new Map(available.map(tool => [tool.name, tool]));
+  let tools = [
+    { id: 'mail', name: 'GMAIL_SEND_EMAIL', sequence: 1, params: { to: message, subject: 'Invitation', body: 'Welcome' } },
+    { id: 'sheet', name: 'GOOGLESHEETS_GET_VALUES', sequence: 1, params: {} },
+  ];
+  tools = router._applyExplicitSourceReferences(tools, schemas, message);
+  tools = router._planIndirectFanOut(tools, schemas, message);
+  const mail = tools.find(tool => tool.id === 'mail');
+  const sheet = tools.find(tool => tool.id === 'sheet');
+  assert.equal(sheet.params.spreadsheet_id, 'https://docs.google.com/spreadsheets/d/sheet-123/edit');
+  assert.equal(sheet.params.range, 'A:Z');
+  assert.equal(mail.params.to, '_inject_each');
+  assert.equal(mail.fanOut.sourceTaskId, 'sheet');
+  assert.deepEqual(mail.dependsOn, ['sheet']);
+});
+
+test('typed recipient validation rejects instructions when no fan-out exists', () => {
+  const router = Object.create(ToolRouter.prototype);
+  router._findDateTimeMissingTimezone = () => [];
+  router._collectMissingRequiredTopLevel = ToolRouter.prototype._collectMissingRequiredTopLevel;
+  router._getFieldPriority = ToolRouter.prototype._getFieldPriority;
+  const schemas = new Map([['GMAIL_SEND_EMAIL', {
+    parameters: {
+      properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
+      required: ['to', 'subject', 'body'],
+    },
+  }]]);
+  const result = router._validateAgainstSchemas([{
+    name: 'GMAIL_SEND_EMAIL',
+    params: { to: 'all emails in the sheet', subject: 'Hi', body: 'Welcome' },
+  }], schemas);
+  assert.ok(result.missing.some(item => item.field === 'to' && item.reason === 'invalid_typed_recipient'));
+});
+
+test('executor extracts, deduplicates and executes one action per source email', async () => {
+  const executor = new ExecutorV2({ composio: {}, query: null });
+  const recipients = executor._extractFanOutValues({ values: [
+    ['Email'],
+    ['One@Example.com'],
+    ['one@example.com', 'two@example.com'],
+  ] }, 'email');
+  assert.deepEqual([...new Set(recipients)], ['one@example.com', 'two@example.com']);
+
+  const executed = [];
+  executor._executeStepWithRetry = async step => {
+    executed.push(step.params.to);
+    return { stepId: step.id, action: step.action, success: true, status: 'success' };
+  };
+  const result = await executor._executeFanOutStep({
+    id: 'mail',
+    type: 'tool',
+    action: 'GMAIL_SEND_EMAIL',
+    params: { to: '_inject_each', subject: 'Hello', body: 'Welcome' },
+    fanOut: { sourceTaskId: 'sheet', targetParam: 'to', valueType: 'email', maxItems: 100 },
+  }, {
+    sheet: { success: true, data: { data: { values: [['one@example.com'], ['two@example.com']] } } },
+  }, 'entity', 'user', {}, {});
+  assert.equal(result.success, true);
+  assert.deepEqual(executed, ['one@example.com', 'two@example.com']);
+});
+
+test('retry context retains the failed action data-source dependency', () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  const tools = [
+    { id: 'sheet', name: 'GOOGLESHEETS_GET_VALUES', dependsOn: [] },
+    { id: 'mail', name: 'GMAIL_SEND_EMAIL', dependsOn: ['sheet'], fanOut: { sourceTaskId: 'sheet' } },
+    { id: 'jira', name: 'JIRA_ADD_COMMENT', dependsOn: [] },
+  ];
+  const retry = orchestrator._buildRetryToolClosure(tools, new Set(['GMAIL_SEND_EMAIL']));
+  assert.deepEqual(retry.map(tool => tool.id), ['sheet', 'mail']);
+});
+
 test('planner reconciliation removes unrelated actions when the user requested a sheet update', () => {
   const router = Object.create(ToolRouter.prototype);
   router._toolkitSearchTerms = ToolRouter.prototype._toolkitSearchTerms;
