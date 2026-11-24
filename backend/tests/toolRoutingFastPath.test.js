@@ -767,6 +767,61 @@ test('planner reconciliation preserves multiple requested actions in the same ap
   ]));
 });
 
+test('known ERPNext record reads remove unrequested DocType discovery', () => {
+  const router = Object.create(ToolRouter.prototype);
+  const availableTools = [
+    {
+      name: 'FRAPPE_SEARCH_DOCTYPES',
+      toolkit: 'FRAPPE',
+      description: 'Search DocTypes by name',
+    },
+    {
+      name: 'FRAPPE_LIST_DOCUMENTS',
+      toolkit: 'FRAPPE',
+      description: 'List records from a specified DocType',
+    },
+  ];
+  const message = 'List exactly 5 records from the ERPNext Customer DocType. Do not search for DocTypes.';
+  const covered = router._ensureRequestedActionsCovered(
+    message,
+    [{ name: 'FRAPPE_SEARCH_DOCTYPES', sequence: 1 }],
+    availableTools
+  );
+  const reconciled = router._reconcileDiscoveryActions(message, covered);
+  assert.deepEqual(reconciled.map(tool => tool.name), ['FRAPPE_LIST_DOCUMENTS']);
+});
+
+test('explicit ERPNext DocType discovery remains available', () => {
+  const router = Object.create(ToolRouter.prototype);
+  const tools = router._reconcileDiscoveryActions(
+    'Search for ERPNext DocTypes containing Customer',
+    [
+      { name: 'FRAPPE_SEARCH_DOCTYPES', sequence: 1 },
+      { name: 'FRAPPE_LIST_DOCUMENTS', sequence: 2 },
+    ]
+  );
+  assert.deepEqual(tools.map(tool => tool.name), ['FRAPPE_SEARCH_DOCTYPES', 'FRAPPE_LIST_DOCUMENTS']);
+});
+
+test('explicit ERPNext DocType and limit override model parameters', () => {
+  const router = Object.create(ToolRouter.prototype);
+  const schemas = new Map([['FRAPPE_LIST_DOCUMENTS', {
+    parameters: {
+      properties: {
+        doctype: { type: 'string' },
+        limit: { type: 'integer' },
+      },
+    },
+  }]]);
+  const tools = router._applyExplicitFrappeParams(
+    'List exactly 5 records from the ERPNext Customer DocType.',
+    [{ name: 'FRAPPE_LIST_DOCUMENTS', params: { doctype: 'Account', limit: 50 } }],
+    schemas
+  );
+  assert.equal(tools[0].params.doctype, 'Customer');
+  assert.equal(tools[0].params.limit, 5);
+});
+
 test('independent multi-app writes never create self or circular dependencies', () => {
   const router = Object.create(ToolRouter.prototype);
   const tools = [

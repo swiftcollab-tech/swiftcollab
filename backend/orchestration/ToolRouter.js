@@ -407,6 +407,10 @@ class ToolRouter {
       stageA.selectedTools,
       availableTools
     );
+    stageA.selectedTools = this._reconcileDiscoveryActions(
+      message,
+      stageA.selectedTools
+    );
 
     // Chat-only response
     if (stageA.selectedTools.length === 1 && stageA.selectedTools[0].name === "chat_response") {
@@ -951,6 +955,13 @@ Choose only connected names. Include EVERY app needed for every requested action
           if (intent === 'send' && !/send|email|message/.test(`${name} ${description}`)) score -= 10;
           if (intent === 'append' && !/append|add.*value|insert.*row|write/.test(`${name} ${description}`)) score -= 8;
           if (intent === 'create' && !/create|new/.test(`${name} ${description}`)) score -= 8;
+          if (intent === 'read' && /\b(records?|documents?|entries|rows)\b/.test(clause.toLowerCase())) {
+            if (/list documents/.test(name)) score += 10;
+            if (/search doctypes|search document types/.test(`${name} ${description}`)) score -= 12;
+          }
+          if (intent === 'read' && /\b(?:search|find|discover|list|show)\b[\s\S]{0,30}\bdoctypes?\b/i.test(clause)) {
+            if (/search doctypes|search document types/.test(`${name} ${description}`)) score += 12;
+          }
           return { tool, score };
         })
         .sort((a, b) => b.score - a.score);
@@ -1047,6 +1058,39 @@ Choose only connected names. Include EVERY app needed for every requested action
     });
 
     return reconciled.sort((a, b) => (a.sequence || 1) - (b.sequence || 1));
+  }
+
+  _reconcileDiscoveryActions(message, selectedTools) {
+    const text = String(message || '');
+    const tools = [...(selectedTools || [])];
+    const names = new Set(tools.map(tool => String(tool.name || '').toUpperCase()));
+    const frappeDocumentRead = [...names].some(name =>
+      ['FRAPPE_LIST_DOCUMENTS', 'FRAPPE_GET_DOCUMENT', 'FRAPPE_COUNT_DOCUMENTS'].includes(name)
+    );
+    if (!frappeDocumentRead) return tools;
+
+    const explicitlyRequestsDiscovery =
+      /\b(?:search|find|discover|list|show)\b[\s\S]{0,40}\bdoctypes?\b/i.test(text)
+      || /\b(?:schema|fields?|metadata)\b[\s\S]{0,30}\b(?:doctype|document type)\b/i.test(text);
+    const explicitlyRejectsDiscovery =
+      /\b(?:do not|don't|without|no need to)\b[\s\S]{0,35}\b(?:search|find|discover|list)\b[\s\S]{0,25}\bdoctypes?\b/i.test(text);
+
+    if (explicitlyRequestsDiscovery && !explicitlyRejectsDiscovery) return tools;
+
+    return tools.filter(tool => {
+      const name = String(tool.name || '').toUpperCase();
+      const isDiscovery = [
+        'FRAPPE_SEARCH_DOCTYPES',
+        'FRAPPE_GET_DOCTYPE_SCHEMA',
+        'FRAPPE_SEARCH_METHODS',
+        'FRAPPE_GET_METHOD_SCHEMA',
+        'FRAPPE_LIST_DOCUMENT_METHODS',
+      ].includes(name);
+      if (isDiscovery) {
+        console.warn(`[ToolRouter] Removed unrequested ERPNext discovery action: ${tool.name}`);
+      }
+      return !isDiscovery;
+    });
   }
 
   /**
@@ -3306,6 +3350,8 @@ OUTPUT JSON ONLY:
       });
     }
 
+    tools = this._applyExplicitFrappeParams(message, tools, selectedSchemas);
+
     tools.sort((a, b) => a.sequence - b.sequence);
 
     // =========================================================================
@@ -3333,6 +3379,29 @@ OUTPUT JSON ONLY:
     });
 
     return { tools, chatResponse: parsed.chatResponse || null };
+  }
+
+  _applyExplicitFrappeParams(message, tools, selectedSchemas) {
+    const text = String(message || '');
+    const doctypeMatch = text.match(/\bERPNext\s+([A-Za-z][A-Za-z0-9]*(?:\s+[A-Za-z][A-Za-z0-9]*){0,3})\s+DocType\b/i)
+      || text.match(/\b([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3})\s+DocType\b/)
+      || text.match(/\b([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3})\s+records?\b/);
+    const explicitDoctype = doctypeMatch?.[1]?.trim() || null;
+    const limitMatch = text.match(/\b(?:up to|exactly|first|limit(?:ed)?\s+to)\s+(\d{1,3})\b/i);
+    const explicitLimit = limitMatch ? Math.max(1, Math.min(100, Number(limitMatch[1]))) : null;
+
+    return (tools || []).map(tool => {
+      if (!/^FRAPPE_(?:LIST|GET|COUNT)_DOCUMENTS?$/i.test(String(tool.name || ''))) return tool;
+      const properties = selectedSchemas.get(tool.name)?.parameters?.properties || {};
+      const params = { ...(tool.params || {}) };
+      if (explicitDoctype && properties.doctype) params.doctype = explicitDoctype;
+      if (explicitLimit) {
+        const limitKey = ['limit', 'limit_page_length', 'page_length', 'page_size']
+          .find(key => properties[key]);
+        if (limitKey) params[limitKey] = explicitLimit;
+      }
+      return { ...tool, params };
+    });
   }
 
   // ===========================================================================
