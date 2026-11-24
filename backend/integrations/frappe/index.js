@@ -33,6 +33,8 @@ const {
   createFrappeClient,
   executeFrappeAction
 } = require('./FrappeClient');
+const { FrappeMcpProvider, frappeMcpProvider } = require('./FrappeMcpProvider');
+const { FrappeProviderService, frappeProviderService } = require('./FrappeProviderService');
 
 module.exports = {
   // Legacy exports (backward compatible)
@@ -54,6 +56,12 @@ module.exports = {
   FrappeClient,
   createFrappeClient,
   executeFrappeAction,
+
+  // Provider-neutral execution (MCP preferred, native REST optional)
+  FrappeMcpProvider,
+  frappeMcpProvider,
+  FrappeProviderService,
+  frappeProviderService,
 
   // Utility exports
   encrypt,

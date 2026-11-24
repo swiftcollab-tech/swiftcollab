@@ -82,18 +82,26 @@ class FrappeConnectionManager {
     connectionName = 'Default ERPNext',
     baseUrl,
     apiKey,
-    apiSecret
+    apiSecret,
+    provider = 'mcp'
   }) {
     // Validate inputs
     if (!baseUrl || !apiKey || !apiSecret) {
       throw new Error('baseUrl, apiKey, and apiSecret are required');
     }
 
+    const normalizedProvider = String(provider || 'mcp').toLowerCase();
+    if (!['mcp', 'native'].includes(normalizedProvider)) {
+      throw new Error("provider must be either 'mcp' or 'native'");
+    }
+
     // Normalize URL (remove trailing slash)
     let normalizedUrl = baseUrl.replace(/\/+$/, '');
 
     // Test connection before saving
-    const testResult = await this.testCredentials(normalizedUrl, apiKey, apiSecret);
+    const testResult = normalizedProvider === 'mcp'
+      ? await require('./FrappeMcpProvider').frappeMcpProvider.testCredentials(normalizedUrl, apiKey, apiSecret)
+      : await this.testCredentials(normalizedUrl, apiKey, apiSecret);
     if (!testResult.success) {
       throw new Error(`Connection test failed: ${testResult.error}`);
     }
@@ -112,8 +120,9 @@ class FrappeConnectionManager {
       `INSERT INTO frappe_connections (
         user_id, connection_name, base_url,
         api_key_encrypted, api_secret_encrypted,
-        status, last_tested_at, erp_user, erp_company, erp_version
-      ) VALUES ($1, $2, $3, $4, $5, 'active', NOW(), $6, $7, $8)
+        status, last_tested_at, erp_user, erp_company, erp_version,
+        provider, mcp_endpoint, mcp_tools
+      ) VALUES ($1, $2, $3, $4, $5, 'active', NOW(), $6, $7, $8, $9, $10, $11::jsonb)
       ON CONFLICT (user_id, connection_name)
       DO UPDATE SET
         base_url = EXCLUDED.base_url,
@@ -125,8 +134,12 @@ class FrappeConnectionManager {
         erp_user = EXCLUDED.erp_user,
         erp_company = EXCLUDED.erp_company,
         erp_version = EXCLUDED.erp_version,
+        provider = EXCLUDED.provider,
+        mcp_endpoint = EXCLUDED.mcp_endpoint,
+        mcp_tools = EXCLUDED.mcp_tools,
         updated_at = NOW()
-      RETURNING id, connection_name, base_url, status, erp_user, erp_company`,
+      RETURNING id, connection_name, base_url, status, erp_user, erp_company,
+                provider, mcp_endpoint, mcp_tools`,
       [
         userId,
         connectionName,
@@ -135,12 +148,15 @@ class FrappeConnectionManager {
         apiSecretEncrypted,
         testResult.user,
         testResult.company,
-        testResult.version
+        testResult.version,
+        normalizedProvider,
+        testResult.mcpEndpoint || null,
+        JSON.stringify(testResult.tools || [])
       ]
     );
 
     // Clear cache
-    this.connectionCache.delete(userId);
+    this.clearCache(userId);
 
     console.log(`[FrappeConnectionManager] Connection created for user ${userId}: ${normalizedUrl}`);
 
@@ -148,7 +164,9 @@ class FrappeConnectionManager {
       success: true,
       connection: result.rows[0],
       erpUser: testResult.user,
-      erpCompany: testResult.company
+      erpCompany: testResult.company,
+      provider: normalizedProvider,
+      toolCount: testResult.tools?.length || 0
     };
   }
 
@@ -383,7 +401,8 @@ class FrappeConnectionManager {
 
     // Fetch from database
     const result = await query(
-      `SELECT id, base_url, api_key_encrypted, api_secret_encrypted, erp_user, erp_company, status
+      `SELECT id, base_url, api_key_encrypted, api_secret_encrypted, erp_user, erp_company, status,
+              provider, mcp_endpoint, mcp_tools
        FROM frappe_connections
        WHERE user_id = $1 AND connection_name = $2`,
       [userId, connectionName]
@@ -406,7 +425,10 @@ class FrappeConnectionManager {
       apiKey: decrypt(row.api_key_encrypted),
       apiSecret: decrypt(row.api_secret_encrypted),
       erpUser: row.erp_user,
-      erpCompany: row.erp_company
+      erpCompany: row.erp_company,
+      provider: row.provider || 'native',
+      mcpEndpoint: row.mcp_endpoint,
+      mcpTools: row.mcp_tools || []
     };
 
     // Cache for 5 minutes
@@ -424,7 +446,8 @@ class FrappeConnectionManager {
   async getConnection(userId, connectionName = 'Default ERPNext') {
     const result = await query(
       `SELECT id, connection_name, base_url, status, last_tested_at, last_error,
-              erp_user, erp_company, erp_version, schema_cached_at, created_at, updated_at
+              erp_user, erp_company, erp_version, schema_cached_at, provider,
+              mcp_endpoint, mcp_tools, created_at, updated_at
        FROM frappe_connections
        WHERE user_id = $1 AND connection_name = $2`,
       [userId, connectionName]
@@ -439,7 +462,8 @@ class FrappeConnectionManager {
   async getConnections(userId) {
     const result = await query(
       `SELECT id, connection_name, base_url, status, last_tested_at, last_error,
-              erp_user, erp_company, erp_version, schema_cached_at, created_at, updated_at
+              erp_user, erp_company, erp_version, schema_cached_at, provider,
+              mcp_endpoint, mcp_tools, created_at, updated_at
        FROM frappe_connections
        WHERE user_id = $1
        ORDER BY created_at DESC`,
@@ -540,16 +564,20 @@ class FrappeConnectionManager {
       throw new Error('Connection not found');
     }
 
-    const testResult = await this.testCredentials(
-      credentials.baseUrl,
-      credentials.apiKey,
-      credentials.apiSecret
-    );
+    const testResult = credentials.provider === 'mcp'
+      ? await require('./FrappeMcpProvider').frappeMcpProvider.testCredentials(
+        credentials.baseUrl,
+        credentials.apiKey,
+        credentials.apiSecret
+      )
+      : await this.testCredentials(credentials.baseUrl, credentials.apiKey, credentials.apiSecret);
 
     await query(
       `UPDATE frappe_connections
        SET status = $2, last_tested_at = NOW(), last_error = $3,
-           erp_user = COALESCE($4, erp_user), erp_company = COALESCE($5, erp_company)
+           erp_user = COALESCE($4, erp_user), erp_company = COALESCE($5, erp_company),
+           mcp_endpoint = COALESCE($7, mcp_endpoint),
+           mcp_tools = CASE WHEN $8::jsonb = '[]'::jsonb THEN mcp_tools ELSE $8::jsonb END
        WHERE user_id = $1 AND connection_name = $6`,
       [
         userId,
@@ -557,9 +585,13 @@ class FrappeConnectionManager {
         testResult.error || null,
         testResult.user,
         testResult.company,
-        connectionName
+        connectionName,
+        testResult.mcpEndpoint || null,
+        JSON.stringify(testResult.tools || [])
       ]
     );
+
+    this.connectionCache.delete(`${userId}:${connectionName}`);
 
     return testResult;
   }

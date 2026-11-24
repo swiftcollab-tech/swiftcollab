@@ -618,6 +618,108 @@ test('external Jira description becomes a derived plan with a dependent finalize
   assert.deepEqual(prepared.routing.tools[1].dependsOn, ['mail']);
 });
 
+test('external Jira finalizer is rejected when planning produced only a terminal no-op', async () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  orchestrator.executor = {
+    executeToolChain: async () => ({
+      success: true,
+      results: [{
+        success: true,
+        action: 'JIRA_GET_ISSUE',
+        data: {
+          data: {
+            fields: {
+              description: {
+                type: 'doc',
+                version: 1,
+                content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Send the customer a welcome email.' }] }],
+              },
+            },
+          },
+        },
+      }],
+    }),
+  };
+  orchestrator.redis = { publish: async () => 0 };
+  orchestrator.toolRouter = {
+    route: async () => ({
+      success: true,
+      tools: [{
+        id: 'bad-terminal-plan',
+        name: 'JIRA_UPDATE_ISSUE',
+        composio_action: 'JIRA_UPDATE_ISSUE',
+        params: { issue_key: 'TEAM-42', status: 'closed' },
+      }],
+      schemas: {},
+    }),
+  };
+
+  const prepared = await orchestrator._prepareExternalInstructionRouting({
+    request: {
+      sourceType: 'jira_issue',
+      sourceTool: 'JIRA_GET_ISSUE',
+      sourceParams: { issue_key: 'TEAM-42' },
+      reference: 'TEAM-42',
+      terminalAction: { name: 'JIRA_TRANSITION_ISSUE', params: { issue_key: 'TEAM-42', transition: 'closed' } },
+    },
+    originalMessage: 'Perform TEAM-42 and close it',
+    enabledToolkits: ['JIRA', 'GMAIL'],
+    context: { entityId: 'entity', userId: 'user', organizationId: 'org', conversationHistory: [] },
+  });
+
+  assert.match(prepared.error, /could not be mapped to executable actions/i);
+  assert.equal(prepared.routing, undefined);
+});
+
+test('external Jira work is replanned when the first model plan contains only the terminal update', async () => {
+  const orchestrator = Object.create(AssistantOrchestrator.prototype);
+  orchestrator.executor = {
+    executeToolChain: async () => ({
+      success: true,
+      results: [{
+        success: true,
+        action: 'JIRA_GET_ISSUE',
+        data: { data: { fields: { description: 'Send a welcome email to user@example.com' } } },
+      }],
+    }),
+  };
+  orchestrator.redis = { publish: async () => 0 };
+  let attempts = 0;
+  orchestrator.toolRouter = {
+    route: async message => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          tools: [{ name: 'JIRA_UPDATE_ISSUE', params: { issue_key: 'TEAM-42', status: 'closed' } }],
+          schemas: {},
+        };
+      }
+      assert.match(message, /Do not update or transition the source work item TEAM-42/i);
+      return {
+        tools: [{ id: 'mail', name: 'GMAIL_SEND_EMAIL', params: { to: 'user@example.com', subject: 'Welcome', body: 'Hello' } }],
+        schemas: {},
+      };
+    },
+  };
+
+  const prepared = await orchestrator._prepareExternalInstructionRouting({
+    request: {
+      sourceType: 'jira_issue',
+      sourceTool: 'JIRA_GET_ISSUE',
+      sourceParams: { issue_key: 'TEAM-42' },
+      reference: 'TEAM-42',
+      terminalAction: { name: 'JIRA_TRANSITION_ISSUE', params: { issue_key: 'TEAM-42', transition: 'closed' } },
+    },
+    originalMessage: 'Perform TEAM-42 and close it',
+    enabledToolkits: ['JIRA', 'GMAIL'],
+    context: { entityId: 'entity', userId: 'user', organizationId: 'org', conversationHistory: [] },
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(prepared.routing.tools.map(tool => tool.name), ['GMAIL_SEND_EMAIL', 'JIRA_TRANSITION_ISSUE']);
+  assert.deepEqual(prepared.routing.tools[1].dependsOn, ['mail']);
+});
+
 test('changed Jira terminal-state follow-ups update the failed retry plan', () => {
   const orchestrator = Object.create(AssistantOrchestrator.prototype);
   const updated = orchestrator._applyStructuredRetryUpdate([{

@@ -17,7 +17,8 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
     baseUrl: '',
     apiKey: '',
     apiSecret: '',
-    connectionName: 'Default ERPNext'
+    connectionName: 'Default ERPNext',
+    provider: 'mcp'
   });
 
   const [testResult, setTestResult] = useState(null); // { success, message, user, company }
@@ -51,7 +52,8 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
         body: JSON.stringify({
           baseUrl: formData.baseUrl.trim(),
           apiKey: formData.apiKey.trim(),
-          apiSecret: formData.apiSecret.trim()
+          apiSecret: formData.apiSecret.trim(),
+          provider: formData.provider
         })
       });
 
@@ -62,7 +64,8 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
           success: true,
           message: 'Connection successful!',
           user: data.user,
-          company: data.company
+          company: data.company,
+          toolCount: data.tools?.length || 0
         });
       } else {
         setTestResult({
@@ -100,7 +103,8 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
           baseUrl: formData.baseUrl.trim(),
           apiKey: formData.apiKey.trim(),
           apiSecret: formData.apiSecret.trim(),
-          connectionName: formData.connectionName
+          connectionName: formData.connectionName,
+          provider: formData.provider
         })
       });
 
@@ -167,6 +171,28 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
 
           {/* Content */}
           <div className="p-6 space-y-4">
+            <div>
+              <label className="text-sm text-gray-300 mb-2 block">Connection method</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleChange('provider', 'mcp')}
+                  className={`p-3 rounded-lg border text-left transition-colors ${formData.provider === 'mcp' ? 'border-cyan-500 bg-cyan-900/30' : 'border-gray-600 bg-gray-900'}`}
+                >
+                  <span className="block text-sm font-semibold text-white">Frappe MCP</span>
+                  <span className="block text-xs text-gray-400 mt-1">Recommended for v16+</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleChange('provider', 'native')}
+                  className={`p-3 rounded-lg border text-left transition-colors ${formData.provider === 'native' ? 'border-cyan-500 bg-cyan-900/30' : 'border-gray-600 bg-gray-900'}`}
+                >
+                  <span className="block text-sm font-semibold text-white">Native REST</span>
+                  <span className="block text-xs text-gray-400 mt-1">Direct API fallback</span>
+                </button>
+              </div>
+            </div>
+
             {/* Instructions */}
             <div className="bg-blue-900/30 border border-blue-500/30 rounded-lg p-4 text-sm">
               <p className="text-blue-300 font-semibold mb-2 flex items-center gap-2">
@@ -178,9 +204,14 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
                 <li>Go to <strong>User</strong> &rarr; <strong>Your User</strong> &rarr; <strong>API Access</strong></li>
                 <li>Click <strong>"Generate Keys"</strong> to create API Key and Secret</li>
                 <li>Copy the API Key and Secret (Secret is shown only once!)</li>
+                {formData.provider === 'mcp' && (
+                  <li>In <strong>System Settings &rarr; AI Agents</strong>, enable the MCP server</li>
+                )}
               </ol>
               <a
-                href="https://frappeframework.com/docs/v14/user/en/api/rest#1-token-based-authentication"
+                href={formData.provider === 'mcp'
+                  ? 'https://docs.frappe.io/framework/user/en/api/mcp'
+                  : 'https://docs.frappe.io/framework/user/en/api/rest'}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 mt-2 text-blue-400 hover:text-blue-300 text-xs"
@@ -261,6 +292,11 @@ const ERPNextConnectModal = ({ visible, onClose, onSuccess, accessToken }) => {
                     <p className="text-green-200/70 text-xs mt-1">
                       Connected as <strong>{testResult.user}</strong>
                       {testResult.company && <> to <strong>{testResult.company}</strong></>}
+                    </p>
+                  )}
+                  {testResult.success && formData.provider === 'mcp' && (
+                    <p className="text-green-200/70 text-xs mt-1">
+                      {testResult.toolCount} supported MCP tools discovered
                     </p>
                   )}
                 </div>

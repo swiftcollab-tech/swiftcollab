@@ -1469,10 +1469,10 @@ class ExecutorV2 {
         console.log(`[ExecutorV2] Frappe action: ${actionName}, userId: ${userId}, entityId: ${entityId}`);
         let frappe;
         if (userId) {
-          // Lazy-load to avoid circular dependency
-          const { executeFrappeAction } = require('../integrations/frappe');
-          console.log(`[ExecutorV2] Calling executeFrappeAction with userId: ${userId}`);
-          frappe = await executeFrappeAction(userId, actionName, finalParams);
+          // The facade dispatches to the explicitly selected MCP or native provider.
+          const { frappeProviderService } = require('../integrations/frappe');
+          console.log(`[ExecutorV2] Calling ERPNext provider with userId: ${userId}`);
+          frappe = await frappeProviderService.executeAction(userId, actionName, finalParams);
         } else if (this.frappeService) {
           frappe = await this.frappeService.execute({
             actionName,

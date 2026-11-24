@@ -1,6 +1,6 @@
 const googleWorkspace = require('../services/googleWorkspaceService');
 const jira = require('../services/jiraConnectorService');
-const { frappeConnectionManager, executeFrappeAction } = require('./frappe');
+const { frappeProviderService } = require('./frappe');
 
 const googleWorkspaceConnector = {
   canExecuteActions: true,
@@ -34,14 +34,13 @@ const googleWorkspaceConnector = {
 const frappeConnector = {
   canExecuteActions: true,
   async getConnectionStatus({ userId }) {
-    const connected = await frappeConnectionManager.hasActiveConnection(userId);
-    return { connected, status: connected ? 'connected' : 'disconnected' };
+    return frappeProviderService.getConnectionStatus(userId);
   },
   supportsAction(actionName) {
     return String(actionName || '').startsWith('FRAPPE_');
   },
   async executeAction({ actionName, params, userId }) {
-    return executeFrappeAction(userId, actionName, params);
+    return frappeProviderService.executeAction(userId, actionName, params);
   },
 };
 

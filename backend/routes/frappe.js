@@ -19,7 +19,7 @@ const { authenticateToken } = require('../middleware/auth');
 const {
   frappeConnectionManager,
   frappeSchemaService,
-  executeFrappeAction,
+  frappeProviderService,
   PRIORITY_DOCTYPES
 } = require('../integrations/frappe');
 
@@ -53,7 +53,13 @@ router.post('/connect', authenticateToken, async (req, res) => {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
 
-    const { baseUrl, apiKey, apiSecret, connectionName = 'Default ERPNext' } = req.body;
+    const {
+      baseUrl,
+      apiKey,
+      apiSecret,
+      connectionName = 'Default ERPNext',
+      provider = 'mcp'
+    } = req.body;
 
     if (!baseUrl || !apiKey || !apiSecret) {
       return res.status(400).json({
@@ -66,20 +72,25 @@ router.post('/connect', authenticateToken, async (req, res) => {
       connectionName,
       baseUrl,
       apiKey,
-      apiSecret
+      apiSecret,
+      provider
     });
 
-    // Sync priority schemas in background
-    frappeSchemaService.syncPrioritySchemas(userId, connectionName).catch(e => {
-      console.error('[Frappe Routes] Background schema sync failed:', e.message);
-    });
+    // Native REST builds DocType schemas locally. MCP supplies its own schemas.
+    if (String(provider).toLowerCase() === 'native') {
+      frappeSchemaService.syncPrioritySchemas(userId, connectionName).catch(e => {
+        console.error('[Frappe Routes] Background schema sync failed:', e.message);
+      });
+    }
 
     res.json({
       success: true,
       message: 'Connected to ERPNext successfully',
       connection: result.connection,
       erpUser: result.erpUser,
-      erpCompany: result.erpCompany
+      erpCompany: result.erpCompany,
+      provider: result.provider,
+      toolCount: result.toolCount
     });
   } catch (error) {
     console.error('[Frappe Routes] Connect error:', error);
@@ -94,9 +105,9 @@ router.post('/connect', authenticateToken, async (req, res) => {
  * Test connection without saving
  * POST /api/frappe/test-connection
  */
-router.post('/test-connection', async (req, res) => {
+router.post('/test-connection', authenticateToken, async (req, res) => {
   try {
-    const { baseUrl, apiKey, apiSecret } = req.body;
+    const { baseUrl, apiKey, apiSecret, provider = 'mcp' } = req.body;
 
     if (!baseUrl || !apiKey || !apiSecret) {
       return res.status(400).json({
@@ -105,7 +116,7 @@ router.post('/test-connection', async (req, res) => {
       });
     }
 
-    const result = await frappeConnectionManager.testCredentials(baseUrl, apiKey, apiSecret);
+    const result = await frappeProviderService.testConnection({ provider, baseUrl, apiKey, apiSecret });
     res.json(result);
   } catch (error) {
     res.status(500).json({
@@ -146,6 +157,9 @@ router.get('/connection', authenticateToken, async (req, res) => {
         erpUser: connection.erp_user,
         erpCompany: connection.erp_company,
         erpVersion: connection.erp_version,
+        provider: connection.provider,
+        mcpEndpoint: connection.mcp_endpoint,
+        toolCount: connection.mcp_tools?.length || 0,
         lastTestedAt: connection.last_tested_at,
         lastError: connection.last_error,
         schemaCachedAt: connection.schema_cached_at
@@ -178,6 +192,9 @@ router.get('/connections', authenticateToken, async (req, res) => {
         status: c.status,
         erpUser: c.erp_user,
         erpCompany: c.erp_company,
+        provider: c.provider,
+        mcpEndpoint: c.mcp_endpoint,
+        toolCount: c.mcp_tools?.length || 0,
         lastTestedAt: c.last_tested_at
       }))
     });
@@ -338,7 +355,7 @@ router.get('/tools', authenticateToken, async (req, res) => {
       return res.status(401).json({ success: false, error: 'Authentication required' });
     }
 
-    const tools = await frappeSchemaService.getAvailableTools(userId);
+    const tools = await frappeProviderService.getAvailableTools(userId);
 
     res.json({
       success: true,
@@ -371,7 +388,7 @@ router.post('/execute', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'actionName is required' });
     }
 
-    const result = await executeFrappeAction(userId, actionName, params || {});
+    const result = await frappeProviderService.executeAction(userId, actionName, params || {});
     res.json(result);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -392,7 +409,7 @@ router.get('/documents/:doctype', authenticateToken, async (req, res) => {
     const { doctype } = req.params;
     const { filters, fields, limit, order_by } = req.query;
 
-    const result = await executeFrappeAction(userId, 'FRAPPE_LIST_DOCUMENTS', {
+    const result = await frappeProviderService.executeAction(userId, 'FRAPPE_LIST_DOCUMENTS', {
       doctype,
       filters: filters ? JSON.parse(filters) : undefined,
       fields: fields ? JSON.parse(fields) : undefined,
@@ -419,7 +436,7 @@ router.get('/documents/:doctype/:name', authenticateToken, async (req, res) => {
 
     const { doctype, name } = req.params;
 
-    const result = await executeFrappeAction(userId, 'FRAPPE_GET_DOCUMENT', {
+    const result = await frappeProviderService.executeAction(userId, 'FRAPPE_GET_DOCUMENT', {
       doctype,
       name
     });
@@ -443,7 +460,7 @@ router.post('/documents/:doctype', authenticateToken, async (req, res) => {
 
     const { doctype } = req.params;
 
-    const result = await executeFrappeAction(userId, 'FRAPPE_CREATE_DOCUMENT', {
+    const result = await frappeProviderService.executeAction(userId, 'FRAPPE_CREATE_DOCUMENT', {
       doctype,
       data: req.body
     });
@@ -467,7 +484,7 @@ router.put('/documents/:doctype/:name', authenticateToken, async (req, res) => {
 
     const { doctype, name } = req.params;
 
-    const result = await executeFrappeAction(userId, 'FRAPPE_UPDATE_DOCUMENT', {
+    const result = await frappeProviderService.executeAction(userId, 'FRAPPE_UPDATE_DOCUMENT', {
       doctype,
       name,
       data: req.body
@@ -492,7 +509,7 @@ router.delete('/documents/:doctype/:name', authenticateToken, async (req, res) =
 
     const { doctype, name } = req.params;
 
-    const result = await executeFrappeAction(userId, 'FRAPPE_DELETE_DOCUMENT', {
+    const result = await frappeProviderService.executeAction(userId, 'FRAPPE_DELETE_DOCUMENT', {
       doctype,
       name
     });

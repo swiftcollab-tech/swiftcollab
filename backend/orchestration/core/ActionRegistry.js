@@ -901,6 +901,39 @@ for (const [action, [name, mutating]] of Object.entries(NATIVE_GOOGLE_ACTIONS)) 
   };
 }
 
+// Frappe v16's built-in MCP server exposes discovery/read tools in addition to
+// the CRUD actions above. Register them centrally so provider-discovered tools
+// still pass SwiftCollab's safety gateway.
+const FRAPPE_MCP_ACTIONS = {
+  FRAPPE_SEARCH_DOCTYPES: ['Search ERPNext document types', false],
+  FRAPPE_GET_DOCTYPE_SCHEMA: ['Read an ERPNext document type schema', false],
+  FRAPPE_SEARCH_METHODS: ['Search Frappe server methods', false],
+  FRAPPE_GET_METHOD_SCHEMA: ['Read a Frappe method schema', false],
+  FRAPPE_LIST_DOCUMENT_METHODS: ['List methods available for an ERPNext document', false],
+  FRAPPE_COUNT_DOCUMENTS: ['Count ERPNext documents', false],
+  FRAPPE_CALL_DOCUMENT_METHOD: ['Call a method on an ERPNext document', true],
+};
+
+for (const [action, [name, mutating]] of Object.entries(FRAPPE_MCP_ACTIONS)) {
+  ACTION_ALLOWLIST.actions[action] = {
+    enabled: true,
+    provider: 'frappe',
+    composio_action: null,
+    category: 'erp',
+    mutating,
+    irreversible: false,
+    description: name,
+    required_scopes: [],
+    user_facing_name: name,
+    examples: [],
+    side_effect_tier: mutating ? SIDE_EFFECT_TIERS.EXPLICIT_WRITE : SIDE_EFFECT_TIERS.PURE_READ,
+    side_effects: mutating ? [{ type: 'erp_document_change', description: name }] : [],
+    preflight_safe: !mutating,
+    preflight_alternative: null,
+    requires_confirmation: mutating,
+  };
+}
+
 // ============================================
 // COMPONENT 2: VERSIONED ALIAS MAP
 // Handle deprecated or renamed actions safely

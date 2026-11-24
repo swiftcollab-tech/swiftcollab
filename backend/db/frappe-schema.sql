@@ -14,6 +14,12 @@ CREATE TABLE IF NOT EXISTS frappe_connections (
     -- ERPNext instance URL (e.g., https://acme.erpnext.com)
     base_url VARCHAR(500) NOT NULL,
 
+    -- Execution provider. MCP is recommended for Frappe/ERPNext v16+;
+    -- native uses the REST API directly.
+    provider VARCHAR(20) NOT NULL DEFAULT 'native' CHECK (provider IN ('native', 'mcp')),
+    mcp_endpoint VARCHAR(500),
+    mcp_tools JSONB NOT NULL DEFAULT '[]'::jsonb,
+
     -- Encrypted credentials (AES-256-GCM)
     -- Format: iv:authTag:encryptedData (base64)
     api_key_encrypted TEXT NOT NULL,
@@ -105,6 +111,7 @@ CREATE TABLE IF NOT EXISTS frappe_execution_logs (
 -- ============================================
 CREATE INDEX IF NOT EXISTS idx_frappe_connections_user_id ON frappe_connections(user_id);
 CREATE INDEX IF NOT EXISTS idx_frappe_connections_status ON frappe_connections(status);
+CREATE INDEX IF NOT EXISTS idx_frappe_connections_provider ON frappe_connections(provider);
 
 CREATE INDEX IF NOT EXISTS idx_frappe_doctype_schemas_connection_id ON frappe_doctype_schemas(connection_id);
 CREATE INDEX IF NOT EXISTS idx_frappe_doctype_schemas_doctype ON frappe_doctype_schemas(doctype_name);

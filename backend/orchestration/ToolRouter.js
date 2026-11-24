@@ -2494,7 +2494,7 @@ Choose only connected names. Include EVERY app needed for every requested action
 
     const toolkitResults = await Promise.all(toolkits.map(async toolkit => {
       try {
-        // Handle FRAPPE specially - fetch from FrappeSchemaService
+        // Handle FRAPPE specially - use the provider selected for this user.
         if (toolkit.toUpperCase() === 'FRAPPE') {
           const frappeTools = await this._getFrappeTools(context.userId);
           return frappeTools;
@@ -2539,7 +2539,7 @@ Choose only connected names. Include EVERY app needed for every requested action
   }
 
   /**
-   * Get Frappe tools from FrappeSchemaService for per-user connection
+   * Get Frappe tools from the user's selected MCP/native provider.
    */
   async _getFrappeTools(userId) {
     if (!userId) {
@@ -2548,8 +2548,7 @@ Choose only connected names. Include EVERY app needed for every requested action
     }
 
     try {
-      // Lazy-load FrappeSchemaService to avoid circular dependencies
-      const { frappeSchemaService, frappeConnectionManager } = require('../integrations/frappe');
+      const { frappeProviderService, frappeConnectionManager } = require('../integrations/frappe');
 
       // Check if user has active connection
       const hasConnection = await frappeConnectionManager.hasActiveConnection(userId);
@@ -2558,8 +2557,7 @@ Choose only connected names. Include EVERY app needed for every requested action
         return this._getGenericFrappeTools();
       }
 
-      // Get dynamically generated tools from cached schemas
-      const tools = await frappeSchemaService.getAvailableTools(userId);
+      const tools = await frappeProviderService.getAvailableTools(userId);
       console.log(`[ToolRouter] Loaded ${tools.length} Frappe tools for user`);
       return tools;
     } catch (err) {

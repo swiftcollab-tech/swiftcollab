@@ -946,8 +946,7 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
       return { error: `I read ${request.reference}, but it does not contain executable instructions or a description.` };
     }
 
-    const planningMessage = `Perform the work requested in this external work item.\n\n${instructions}`;
-    const routing = await this.toolRouter.route(planningMessage, enabledToolkits, {
+    const externalContext = {
       ...context,
       externalInstructionSource: {
         type: request.sourceType,
@@ -959,22 +958,23 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
         { role: 'user', content: originalMessage },
         { role: 'system', content: `External work item ${request.reference} was read successfully.` },
       ],
-    });
+    };
+    const planningMessage = `Perform the work requested in this external work item.\n\n${instructions}`;
+    let routing = await this.toolRouter.route(planningMessage, enabledToolkits, externalContext);
 
-    let executable = (routing.tools || []).filter(tool => tool.name !== 'chat_response');
-    // The source item's terminal state is controlled only by the finalizer.
-    // External text cannot move it early and bypass completion dependencies.
-    if (request.terminalAction) {
-      executable = executable
-        .filter(tool => String(tool.composio_action || tool.name || '').toUpperCase() !== 'JIRA_TRANSITION_ISSUE')
-        .map(tool => {
-          const action = String(tool.composio_action || tool.name || '').toUpperCase();
-          if (action !== 'JIRA_UPDATE_ISSUE') return tool;
-          const params = { ...(tool.params || {}) };
-          delete params.status;
-          delete params.transition;
-          return { ...tool, params };
-        });
+    let executable = this._sanitizeExternalActions(routing.tools, request);
+    if (request.terminalAction && executable.length === 0 && !routing.needsConnection) {
+      // Small models occasionally plan only the requested terminal transition.
+      // Give the planner one constrained recovery attempt before failing safely.
+      const correctiveMessage = [
+        `Create an execution plan for the actual work described in ${request.reference}.`,
+        `Do not update or transition the source work item ${request.reference}; SwiftCollab handles that only after the work succeeds.`,
+        'Select every required action in the connected applications. If the work cannot be executed, request the missing information instead of returning a source-ticket update.',
+        '',
+        instructions,
+      ].join('\n');
+      routing = await this.toolRouter.route(correctiveMessage, enabledToolkits, externalContext);
+      executable = this._sanitizeExternalActions(routing.tools, request);
     }
     if (routing.needsConnection) return { error: routing.clarificationQuestion || 'A required application is not connected.' };
     if (executable.length === 0) {
@@ -1022,6 +1022,44 @@ Extract email addresses. "yes with email@test.com" = approval with updates.`;
         createdAt: Date.now(),
       },
     };
+  }
+
+  _isMeaningfulExternalAction(tool) {
+    const action = String(tool?.composio_action || tool?.action || tool?.name || '').toUpperCase();
+    if (action !== 'JIRA_UPDATE_ISSUE') return true;
+
+    // An LLM may map the user's final "close the ticket" instruction to an
+    // update containing only the issue identifier. After terminal fields are
+    // removed, that is a no-op and must not count as completion of the work
+    // described by the external ticket.
+    const identifierFields = new Set([
+      'issue_key', 'issuekey', 'issue_id', 'issueid', 'id', 'key',
+    ]);
+    return Object.entries(tool?.params || {}).some(([key, value]) =>
+      !identifierFields.has(String(key).toLowerCase())
+      && value !== undefined
+      && value !== null
+      && value !== ''
+    );
+  }
+
+  _sanitizeExternalActions(tools, request) {
+    let executable = (tools || []).filter(tool => tool.name !== 'chat_response');
+    if (!request?.terminalAction) return executable;
+
+    // The source item's terminal state is controlled only by the finalizer.
+    // External text cannot move it early and bypass completion dependencies.
+    return executable
+      .filter(tool => String(tool.composio_action || tool.name || '').toUpperCase() !== 'JIRA_TRANSITION_ISSUE')
+      .map(tool => {
+        const action = String(tool.composio_action || tool.name || '').toUpperCase();
+        if (action !== 'JIRA_UPDATE_ISSUE') return tool;
+        const params = { ...(tool.params || {}) };
+        delete params.status;
+        delete params.transition;
+        return { ...tool, params };
+      })
+      .filter(tool => this._isMeaningfulExternalAction(tool));
   }
 
   _extractExternalInstructions(executionResult, sourceType) {
