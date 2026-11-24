@@ -70,6 +70,45 @@ function pickFirstArray(payload, paths = []) {
     return [];
 }
 
+function isSensitiveDisplayKey(key) {
+    return /token|secret|password|authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token/i.test(safeString(key));
+}
+
+function findDisplayArray(value, depth = 0, seen = new Set()) {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== "object" || depth > 4 || seen.has(value)) return null;
+    seen.add(value);
+
+    const priority = [
+        "values", "rows", "items", "results", "records", "documents", "doctypes",
+        "messages", "emails", "issues", "events", "customers", "data",
+    ];
+    let emptyArray = null;
+    for (const key of priority) {
+        if (Array.isArray(value[key])) {
+            if (value[key].length) return value[key];
+            emptyArray = emptyArray || value[key];
+        }
+    }
+    for (const [key, child] of Object.entries(value)) {
+        if (isSensitiveDisplayKey(key) || key === "headers" || key === "raw") continue;
+        const found = findDisplayArray(child, depth + 1, seen);
+        if (found) return found;
+    }
+    return emptyArray;
+}
+
+function displayScalar(value, max = 240) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return truncate(value.replace(/\s+/g, " ").trim(), max);
+    if (["number", "boolean", "bigint"].includes(typeof value)) return String(value);
+    try { return truncate(JSON.stringify(value), max); } catch (_) { return truncate(value, max); }
+}
+
+function escapeTableCell(value) {
+    return displayScalar(value, 160).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
 function dedupeStrings(arr) {
     if (!Array.isArray(arr)) return [];
     const seen = new Set();
@@ -216,6 +255,10 @@ function actionToService(actionUpper) {
     if (actionUpper.includes("SLACK")) return "slack";
     if (actionUpper.includes("AXONAUT")) return "axonaut";
     if (actionUpper.includes("GITHUB")) return "github";
+    if (actionUpper.includes("FRAPPE") || actionUpper.includes("ERPNEXT")) return "erpnext";
+    if (actionUpper.includes("GOOGLESHEETS")) return "google_sheets";
+    if (actionUpper.includes("GOOGLEDRIVE")) return "google_drive";
+    if (actionUpper.includes("GOOGLEDOCS")) return "google_docs";
     if (actionUpper.startsWith("SYSTEM_")) return "system";
     return "unknown";
 }
@@ -225,7 +268,7 @@ function classifyVerb(actionUpper) {
     if (/(CREATE|ADD|POST|SEND|OPEN|START)/.test(actionUpper)) return "create";
     if (/(UPDATE|EDIT|PATCH|MODIFY|SET)/.test(actionUpper)) return "update";
     if (/(DELETE|REMOVE|ARCHIVE)/.test(actionUpper)) return "delete";
-    if (/(GET|FETCH|READ|RETRIEVE)/.test(actionUpper)) return "get";
+    if (/(GET|FETCH|READ|RETRIEVE|COUNT|LOOKUP)/.test(actionUpper)) return "get";
     if (/(LIST|SEARCH|FIND|QUERY)/.test(actionUpper)) return "list";
     return "other";
 }
@@ -410,6 +453,10 @@ class ActionResultFormatter {
         const fn = this.registry[actionUpper];
         if (fn) {
             const out = fn(norm.payload, context, { timezone });
+            if ((classifyVerb(actionUpper) === "list" || classifyVerb(actionUpper) === "get") && !out?.details) {
+                const generic = this._formatGenericRead(actionUpper, norm.payload);
+                if (generic?.details) return this._finalize(actionUpper, service, generic, norm, links);
+            }
             return this._finalize(actionUpper, service, out, norm, links);
         }
 
@@ -996,6 +1043,10 @@ class ActionResultFormatter {
         const verb = classifyVerb(actionUpper);
         const links = extractLinks(payload);
 
+        if (verb === "list" || verb === "get") {
+            return this._formatGenericRead(actionUpper, payload, links);
+        }
+
         // Try to detect list-like payloads
         const list = Array.isArray(payload)
             ? payload
@@ -1027,6 +1078,77 @@ class ActionResultFormatter {
             objectId: id,
             links,
             structured: { id: id || null, title: title || null },
+        };
+    }
+
+    _formatGenericRead(actionUpper, payload, links = []) {
+        const list = findDisplayArray(payload);
+        if (Array.isArray(list)) {
+            if (list.length === 0) {
+                return {
+                    summary: `No results found for ${this._humanActionName(actionUpper)}`,
+                    details: null,
+                    links,
+                    structured: { count: 0 },
+                };
+            }
+
+            const rows = list.slice(0, this.maxItems);
+            let details;
+            if (rows.every(row => Array.isArray(row))) {
+                details = rows.map((row, index) => `${index + 1}. ${row.map(escapeTableCell).join(" | ")}`).join("\n");
+            } else if (rows.every(row => row === null || typeof row !== "object")) {
+                details = rows.map(value => `- ${displayScalar(value, 300)}`).join("\n");
+            } else {
+                details = rows.map(item => {
+                    if (!item || typeof item !== "object") return `- ${displayScalar(item)}`;
+                    const fields = Object.entries(item)
+                        .filter(([key, value]) => !isSensitiveDisplayKey(key) && value !== null && value !== undefined)
+                        .slice(0, 6)
+                        .map(([key, value]) => `${key}: ${displayScalar(value, 180)}`);
+                    return `- ${fields.join("; ") || "(empty result)"}`;
+                }).join("\n");
+            }
+
+            return {
+                summary: `${this._humanActionName(actionUpper)} returned ${list.length} result${list.length === 1 ? "" : "s"}`,
+                details,
+                links,
+                structured: { count: list.length, items: rows },
+            };
+        }
+
+        if (payload !== null && payload !== undefined && typeof payload !== "object") {
+            return {
+                summary: `${this._humanActionName(actionUpper)} result`,
+                details: displayScalar(payload, this.maxDetailsChars),
+                links,
+                structured: { value: payload },
+            };
+        }
+
+        if (payload && typeof payload === "object") {
+            const fields = Object.entries(payload)
+                .filter(([key, value]) => !isSensitiveDisplayKey(key)
+                    && value !== null && value !== undefined
+                    && typeof value !== "function")
+                .slice(0, 12)
+                .map(([key, value]) => `- ${key}: ${displayScalar(value, 400)}`);
+            if (fields.length) {
+                return {
+                    summary: `${this._humanActionName(actionUpper)} result`,
+                    details: fields.join("\n"),
+                    links,
+                    structured: { fields: fields.length },
+                };
+            }
+        }
+
+        return {
+            summary: `${this._humanActionName(actionUpper)} completed, but the provider returned no displayable data`,
+            details: null,
+            links,
+            structured: {},
         };
     }
 }
